@@ -1,0 +1,255 @@
+// CRITICAL: This schema file is shared across multiple applications. Only make edits with explicit user consent. Changes here affect all apps using this database.
+
+generator client {
+    provider = "prisma-client-js"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x"]
+    output = "/home/ubuntu/pnlmaker_dashboard_v3/nextjs_space/node_modules/.prisma/client"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model app_config {
+  id         String   @id @default(uuid())
+  key        String   @unique
+  value      String   @default("")
+  updated_at DateTime @updatedAt
+  created_at DateTime @default(now())
+}
+
+// ─── Crypto DCA Bot models (additive) ───
+
+model api_key {
+  id         String   @id @default(uuid())
+  key        String   @unique
+  name       String   @default("default")
+  active     Boolean  @default(true)
+  created_at DateTime @default(now())
+}
+
+model strategy {
+  id              String   @id @default(uuid())
+  name            String   @default("DCA Principal")
+  source_token    String   @default("USDC")
+  target_token    String   @default("WETH")
+  chain           String   @default("arbitrum")
+  amount_per_buy  String   @default("50")
+  frequency       String   @default("daily")
+  slippage_bps    Int      @default(50)
+  max_per_trade   String   @default("200")
+  smart_dca       Boolean  @default(false)
+  active          Boolean  @default(true)
+  paused          Boolean  @default(false)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+  trades          trade[]
+}
+
+model trade {
+  id             String    @id @default(uuid())
+  strategy_id    String?
+  strategy       strategy? @relation(fields: [strategy_id], references: [id])
+  source         String    @default("dca")
+  chain          String
+  source_token   String
+  target_token   String
+  side           String    @default("buy")
+  amount_in      String
+  amount_out     String
+  price          String
+  gas_paid       String    @default("0")
+  tx_hash        String    @default("")
+  status         String    @default("completed")
+  error_message  String?
+  executed_at    DateTime  @default(now())
+}
+
+model portfolio_snapshot {
+  id           String   @id @default(uuid())
+  chain        String
+  token        String
+  balance      String
+  price_usd    String   @default("0")
+  value_usd    String   @default("0")
+  snapshot_at  DateTime @default(now())
+}
+
+model price_history {
+  id          String   @id @default(uuid())
+  chain       String
+  token       String
+  price_usd   String
+  recorded_at DateTime @default(now())
+
+  @@index([chain, token, recorded_at])
+}
+
+model momentum_config {
+  id                 String     @id @default(uuid())
+  name               String     @default("Moteur Momentum")
+  chain              String     @default("base")
+  budget_usd         String     @default("4000")
+  deployed_usd       String     @default("0")
+  tokens             String     @default("WETH")
+  max_per_trade_pct  Int        @default(20)
+  stop_loss_pct      Int        @default(8)
+  take_profit_levels String     @default("30,60,100")
+  ma_short           Int        @default(10)
+  ma_long            Int        @default(30)
+  rsi_period         Int        @default(14)
+  rsi_oversold       Int        @default(35)
+  rsi_overbought     Int        @default(70)
+  active             Boolean    @default(true)
+  paused             Boolean    @default(false)
+  created_at         DateTime   @default(now())
+  updated_at         DateTime   @updatedAt
+  positions          position[]
+}
+
+model coupling_config {
+  id                      String   @id @default(uuid())
+  modulation_enabled      Boolean  @default(true)
+  boost_max               String   @default("2.0")
+  brake_min               String   @default("0.3")
+  rebalance_enabled       Boolean  @default(false)
+  rebalance_max_pct       Int      @default(10)
+  rebalance_threshold_pct Int      @default(5)
+  created_at              DateTime @default(now())
+  updated_at              DateTime @updatedAt
+}
+
+model coupling_decision {
+  id         String   @id @default(uuid())
+  kind       String
+  chain      String   @default("")
+  token      String   @default("")
+  detail     String
+  payload    String   @default("{}")
+  created_at DateTime @default(now())
+
+  @@index([kind, created_at])
+}
+
+model position {
+  id             String          @id @default(uuid())
+  config_id      String
+  config         momentum_config @relation(fields: [config_id], references: [id])
+  chain          String
+  token          String
+  amount_token   String
+  initial_amount String          @default("0")
+  entry_price    String
+  cost_usd       String
+  highest_price  String          @default("0")
+  tp_hits        String          @default("")
+  status         String          @default("open")
+  opened_at      DateTime        @default(now())
+  updated_at     DateTime        @updatedAt
+  closed_at      DateTime?
+}
+
+model risk_config {
+  id                      String    @id @default(uuid())
+  max_drawdown_pct        Int       @default(15)
+  position_limit_pct      Int       @default(40)
+  trailing_enabled        Boolean   @default(true)
+  trailing_activation_pct Int       @default(10)
+  ath_value_usd           String    @default("0")
+  ath_recorded_at         DateTime?
+  global_paused           Boolean   @default(false)
+  paused_reason           String    @default("")
+  paused_at               DateTime?
+  updated_at              DateTime  @updatedAt
+  created_at              DateTime  @default(now())
+}
+
+model risk_event {
+  id         String   @id @default(uuid())
+  kind       String
+  detail     String   @default("")
+  payload    String   @default("{}")
+  created_at DateTime @default(now())
+
+  @@index([kind, created_at])
+}
+
+model backtest {
+  id                String   @id @default(uuid())
+  strategy_type     String   // "dca" | "momentum"
+  chain             String
+  tokens            String   // JSON array
+  params            String   // JSON serialized inputs
+  start_date        DateTime
+  end_date          DateTime
+  initial_capital   String   @default("10000")
+  final_equity      String   @default("0")
+  total_return_pct  String   @default("0")
+  annualized_pct    String   @default("0")
+  max_drawdown_pct  String   @default("0")
+  sharpe_ratio      String   @default("0")
+  win_rate_pct      String   @default("0")
+  trades_count      Int      @default(0)
+  buy_hold_pct      String   @default("0")
+  equity_curve      String   @default("[]") // JSON array of {t,equity}
+  trades            String   @default("[]") // JSON array of simulated trades
+  notes             String   @default("")
+  created_at        DateTime @default(now())
+
+  @@index([strategy_type, created_at])
+}
+
+model order {
+  id                String    @id @default(uuid())
+  kind              String    // "twap" | "limit"
+  chain             String
+  source_token      String    // token dépensé (généralement USDC pour un buy)
+  target_token      String    // token reçu (ou vendu si side=sell)
+  side              String    @default("buy") // "buy" | "sell"
+  total_amount_in   String    // montant total à échanger (dans la devise du source_token)
+  tranche_size      String    @default("0") // taille d'une tranche (TWAP)
+  tranches_total   Int       @default(1)
+  tranches_done    Int       @default(0)
+  interval_seconds  Int       @default(0) // intervalle entre tranches (TWAP)
+  next_execution_at DateTime? // prochaine tranche prévue (TWAP) ou null (limit)
+  target_price      String    @default("0") // prix seuil (limit)
+  direction         String    @default("") // "below" (buy si prix<=) | "above" (sell si prix>=)
+  slippage_bps      Int       @default(100)
+  status            String    @default("pending") // pending | active | completed | cancelled | failed
+  amount_filled     String    @default("0") // cumul source dépensé
+  amount_received   String    @default("0") // cumul target reçu
+  last_error        String    @default("")
+  notes             String    @default("")
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+  completed_at      DateTime?
+
+  @@index([status, kind])
+  @@index([next_execution_at])
+}
+
+model wallet_ledger {
+  id           String   @id @default(uuid())
+  chain        String
+  token        String
+  kind         String   // "deposit" (dépôt externe) ou "withdrawal" (retrait externe)
+  amount       String   // quantité de token (valeur absolue)
+  value_usd    String   @default("0")
+  source       String   @default("auto") // "auto" (détecté) ou "manual" (saisi)
+  note         String   @default("")
+  detected_at  DateTime @default(now())
+
+  @@index([chain, token, detected_at])
+}
+
+// ─── Auth (dashboard PnL Maker) ───
+model User {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  password   String
+  name       String?
+  role       String   @default("user")
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+}

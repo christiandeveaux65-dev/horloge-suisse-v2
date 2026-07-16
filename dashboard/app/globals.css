@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 20% 4%;
+    --foreground: 210 20% 92%;
+    --card: 233 18% 8%;
+    --card-foreground: 210 20% 92%;
+    --popover: 233 18% 9%;
+    --popover-foreground: 210 20% 92%;
+    --primary: 160 70% 48%;
+    --primary-foreground: 240 20% 5%;
+    --secondary: 233 15% 14%;
+    --secondary-foreground: 210 20% 88%;
+    --muted: 233 15% 14%;
+    --muted-foreground: 220 10% 62%;
+    --accent: 199 89% 55%;
+    --accent-foreground: 240 20% 5%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 210 20% 96%;
+    --border: 233 15% 16%;
+    --input: 233 15% 18%;
+    --ring: 160 70% 48%;
+    --radius: 0.75rem;
+    --chart-1: 160 70% 48%;
+    --chart-2: 199 89% 55%;
+    --chart-3: 262 80% 66%;
+    --chart-4: 32 95% 58%;
+    --chart-5: 340 82% 62%;
+  }
+
+  .dark {
+    --background: 240 20% 4%;
+    --foreground: 210 20% 92%;
+    --card: 233 18% 8%;
+    --card-foreground: 210 20% 92%;
+    --popover: 233 18% 9%;
+    --popover-foreground: 210 20% 92%;
+    --primary: 160 70% 48%;
+    --primary-foreground: 240 20% 5%;
+    --secondary: 233 15% 14%;
+    --secondary-foreground: 210 20% 88%;
+    --muted: 233 15% 14%;
+    --muted-foreground: 220 10% 62%;
+    --accent: 199 89% 55%;
+    --accent-foreground: 240 20% 5%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 210 20% 96%;
+    --border: 233 15% 16%;
+    --input: 233 15% 18%;
+    --ring: 160 70% 48%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
+
+/* Masquer les erreurs d'hydratation */
+[data-hydration-error] {
+  display: none !important;
+}
+
+@layer utilities {
+  .glow-card {
+    box-shadow: 0 0 0 1px hsl(233 15% 16%), 0 4px 24px -4px rgba(0, 0, 0, 0.5);
+    transition: box-shadow 0.3s ease, transform 0.3s ease;
+  }
+  .glow-card:hover {
+    box-shadow: 0 0 0 1px hsl(160 70% 48% / 0.35), 0 8px 32px -4px rgba(34, 211, 165, 0.12);
+  }
+  .glow-green {
+    box-shadow: 0 0 20px rgba(34, 211, 165, 0.15);
+  }
+  .glow-red {
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.2);
+  }
+  .text-gain {
+    color: #2dd4a7;
+  }
+  .text-loss {
+    color: #f87171;
+  }
+}
+
+/* Scrollbar sombre */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(233 15% 20%);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(233 15% 28%);
+}
