@@ -20,6 +20,7 @@ import { StrategistService } from '../strategist/strategist.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { OptimizeInjectService } from '../optimize-inject/optimize-inject.service';
 import { SupervisionService } from '../supervision/supervision.service';
+import { StrategyEvaluatorService } from '../strategy-evaluator/strategy-evaluator.service';
 
 /**
  * Fréquences (ms) de chaque module, alignées sur des buckets epoch via acquireCronRun.
@@ -47,6 +48,7 @@ export const MODULE_INTERVALS_MS: Record<string, number> = {
   telegram_summary: 21600000, // 6 h
   auto_reoptimize: 3600000, // 1 h
   supervision: 300000, // 5 min
+  strategy_evaluator: 900000, // 15 min
 };
 
 function humanFreq(ms: number): string {
@@ -85,6 +87,7 @@ export class PipelineOrchestrator {
     private readonly telegram: TelegramService,
     private readonly optimizeInject: OptimizeInjectService,
     private readonly supervision: SupervisionService,
+    private readonly strategyEvaluator: StrategyEvaluatorService,
   ) {}
 
   /** UNIQUE @Cron du système : toutes les 3 minutes. Remplace les 18 @Cron individuels. */
@@ -178,6 +181,9 @@ export class PipelineOrchestrator {
       await run('portfolio_ledger', 'Phase 4 MESURER', () => this.portfolio.tickLedger());
       await run('aave', 'Phase 4 MESURER', () => this.aave.tick());
       await run('stablecoin_yield', 'Phase 4 MESURER', () => this.stablecoinYield.tick());
+
+      // ─── Phase 5bis ÉVALUATION — scoring des stratégies (entre supervision et strategist) ───
+      await run('strategy_evaluator', 'Phase 5bis ÉVALUATION', () => this.strategyEvaluator.tick());
 
       // ─── Phase 5 STRATÉGIE ───
       await run('strategist', 'Phase 5 STRATÉGIE', () => this.strategist.tick());

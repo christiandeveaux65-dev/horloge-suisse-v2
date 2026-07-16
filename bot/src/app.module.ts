@@ -6,6 +6,7 @@ import { ApiModule } from './api/api.module';
 import { TelegramModule } from './telegram/telegram.module';
 import { PipelineModule } from './pipeline/pipeline.module';
 import { SupervisionModule } from './supervision/supervision.module';
+import { StrategyEvaluatorModule } from './strategy-evaluator/strategy-evaluator.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { SupervisionModule } from './supervision/supervision.module';
     ApiModule,
     PipelineModule,
     SupervisionModule,
+    StrategyEvaluatorModule,
   ],
 })
 export class AppModule {}

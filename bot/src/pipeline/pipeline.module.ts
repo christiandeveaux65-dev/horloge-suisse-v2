@@ -18,6 +18,7 @@ import { StrategistModule } from '../strategist/strategist.module';
 import { TelegramModule } from '../telegram/telegram.module';
 import { OptimizeInjectModule } from '../optimize-inject/optimize-inject.module';
 import { SupervisionModule } from '../supervision/supervision.module';
+import { StrategyEvaluatorModule } from '../strategy-evaluator/strategy-evaluator.module';
 import { PipelineOrchestrator } from './pipeline.orchestrator';
 import { PipelineController } from './pipeline.controller';
 
@@ -42,6 +43,7 @@ import { PipelineController } from './pipeline.controller';
     TelegramModule,
     OptimizeInjectModule,
     SupervisionModule,
+    StrategyEvaluatorModule,
   ],
   controllers: [PipelineController],
   providers: [PipelineOrchestrator],

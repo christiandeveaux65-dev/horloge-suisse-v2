@@ -333,6 +333,7 @@ export class ApiController {
       stablecoin_yield: { schedule: '*/30 min',        role: 'Rotation de rendement stablecoin (MVP)',     trades: 'non (compare+log, rotation non branchée)' },
       telegram_summary: { schedule: 'toutes les 6 h',  role: 'Résumé périodique Telegram',                 trades: 'non (notification)' },
       supervision:      { schedule: '*/5 min',         role: 'Supervision proactive (auto-pause + alertes)', trades: 'non (surveillance + auto-pause)' },
+      strategy_evaluator: { schedule: '*/15 min',      role: 'Évaluateur de stratégies (scoring + allocations)', trades: 'non (analyse + recommandations)' },
     };
 
     // Depuis la refonte : UN SEUL @Cron interne (« pipeline ») orchestre TOUS les modules
