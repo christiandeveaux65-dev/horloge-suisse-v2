@@ -1,3 +1,8 @@
+// Fuseau horaire de l'application : Europe/Paris (UTC+1 hiver / UTC+2 été).
+// Doit être défini AVANT toute opération Date / démarrage du scheduler afin que
+// les crons, logs et timestamps soient tous calés sur l'heure de Paris.
+process.env.TZ = 'Europe/Paris';
+
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
@@ -65,7 +70,10 @@ async function bootstrap() {
     `,
   });
 
-  const port = 3000;
+  // Hooks d'arrêt : permet à TelegramService.onApplicationShutdown de notifier
+  app.enableShutdownHooks();
+
+  const port = Number(process.env.PORT) || 3000;
   await app.listen(port);
   Logger.log(`\ud83d\udd52 L'Horloge Suisse v2 d\u00e9marr\u00e9e sur le port ${port}`, 'Bootstrap');
   Logger.log(`\ud83d\udcda API docs : http://localhost:${port}/${swaggerPath}`, 'Bootstrap');

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
 import { GRID_BUDGET_USD, GRID_LEVELS, GRID_PER_LEVEL_USD } from '../constants';
@@ -26,9 +27,10 @@ export class GridService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  @Cron('0 */3 * * * *')
+  @Cron('0 */3 * * * *', { timeZone: 'Europe/Paris', name: 'grid' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'grid', 180000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {
@@ -75,8 +77,8 @@ export class GridService {
     }
     const currentPrice = prices[prices.length - 1];
 
-    // Fourchette auto : ±8% autour du prix courant (borne dure de sécurité).
-    const rangePct = 8;
+    // Fourchette auto : ±3.5% autour du prix courant (borne dure de sécurité).
+    const rangePct = 3.5;
     let lower = parseFloat(cfg.price_lower);
     let upper = parseFloat(cfg.price_upper);
 
@@ -85,17 +87,11 @@ export class GridService {
       const center = (lower + upper) / 2;
       const driftPct = Math.abs(currentPrice - center) / center;
       if (driftPct > 0.05) {
-        this.logger.warn(`⚡ Rebalancing grille : prix $${currentPrice.toFixed(2)} dévié de ${(driftPct * 100).toFixed(1)}% du centre $${center.toFixed(2)}`);
-        await this.prisma.grid_order.updateMany({
-          where: { config_id: cfg.id, status: 'pending' },
-          data: { status: 'cancelled' },
-        });
+        this.logger.warn(`Rebalancing grille : prix $${currentPrice.toFixed(2)} dévié de ${(driftPct * 100).toFixed(1)}% du centre $${center.toFixed(2)}`);
+        await this.prisma.grid_order.updateMany({ where: { config_id: cfg.id, status: 'pending' }, data: { status: 'cancelled' } });
         lower = currentPrice * (1 - rangePct / 100);
         upper = currentPrice * (1 + rangePct / 100);
-        await this.prisma.grid_config.update({
-          where: { id: cfg.id },
-          data: { price_lower: lower.toString(), price_upper: upper.toString() },
-        });
+        await this.prisma.grid_config.update({ where: { id: cfg.id }, data: { price_lower: lower.toString(), price_upper: upper.toString() } });
       }
     }
 

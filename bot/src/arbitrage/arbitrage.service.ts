@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
 import { BlockchainService } from '../blockchain/blockchain.service';
@@ -12,11 +13,18 @@ import {
  * Arbitrage DEX — détecte une divergence entre le prix exécutable on-chain (quote Uniswap)
  * et le prix de référence KuCoin. Exécute uniquement si l'écart couvre gas+slippage
  * (>= 50 bps) et reste < 500 bps (au-delà = anomalie rejetée).
- * Montant max par arbitrage : $500 (hardcodé). Cron toutes les 2 minutes.
+ * Montant max par arbitrage : $200 (conservateur). Cron toutes les 5 minutes.
+ *
+ * ✅ RÉACTIVÉ (Phase finale — juillet 2026) avec des paramètres PRUDENTS suite aux
+ * recommandations de l'analyste : spread min relevé à 100 bps (au lieu de 50), ticket
+ * réduit à $200 (au lieu de $500), fréquence ralentie à 5 min (au lieu de 2 min).
+ * Le profit net après gas est systématiquement vérifié avant toute exécution ; seules
+ * les opportunités réellement rentables (token sous-évalué sur le DEX) sont exécutées.
  */
 @Injectable()
-export class ArbitrageService {
+export class ArbitrageService implements OnModuleInit {
   private readonly logger = new Logger(ArbitrageService.name);
+  // Réactivé (Phase finale) avec paramètres conservateurs.
   private enabled = true;
 
   constructor(
@@ -29,9 +37,46 @@ export class ArbitrageService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  @Cron('0 */2 * * * *')
+  /** Phase finale : réactive la config arbitrage avec des paramètres conservateurs. */
+  async onModuleInit(): Promise<void> {
+    try {
+      let cfg = await this.prisma.arbitrage_config.findFirst();
+      if (!cfg) {
+        cfg = await this.prisma.arbitrage_config.create({
+          data: {
+            name: 'Arbitrage DEX',
+            tokens: 'WETH,WBTC,ARB',
+            min_spread_bps: ARB_MIN_SPREAD_BPS,
+            max_amount_per_arb: String(ARB_MAX_TRADE_USD),
+            active: true,
+            paused: false,
+          },
+        });
+        this.logger.log('Arbitrage RÉACTIVÉ : config créée (conservatrice)');
+      } else {
+        // Réactive et normalise sur les paramètres conservateurs.
+        await this.prisma.arbitrage_config.update({
+          where: { id: cfg.id },
+          data: {
+            active: true,
+            paused: false,
+            min_spread_bps: ARB_MIN_SPREAD_BPS,
+            max_amount_per_arb: String(ARB_MAX_TRADE_USD),
+          },
+        });
+        this.logger.log(
+          `Arbitrage RÉACTIVÉ : spread min ${ARB_MIN_SPREAD_BPS} bps, ticket max $${ARB_MAX_TRADE_USD}, cron 5 min`,
+        );
+      }
+    } catch (err: any) {
+      this.logger.error(`Impossible de réactiver l'arbitrage: ${err.message}`);
+    }
+  }
+
+  @Cron('0 */5 * * * *', { timeZone: 'Europe/Paris', name: 'arbitrage' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'arbitrage', 300000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {
@@ -48,8 +93,8 @@ export class ArbitrageService {
           tokens: 'WETH,WBTC,ARB',
           min_spread_bps: ARB_MIN_SPREAD_BPS,
           max_amount_per_arb: String(ARB_MAX_TRADE_USD),
-          active: true,
-          paused: false,
+          active: false,
+          paused: true,
         },
       });
       this.logger.log(`Config arbitrage initialisée (spread ${ARB_MIN_SPREAD_BPS}-${ARB_MAX_SPREAD_BPS} bps, max $${ARB_MAX_TRADE_USD})`);
@@ -58,6 +103,11 @@ export class ArbitrageService {
   }
 
   async executeCycle(): Promise<any> {
+    // Garde-fou : module arrêté (Phase 1). Bloque aussi l'exécution manuelle.
+    if (!this.enabled) {
+      return { success: false, reason: 'module_desactive' };
+    }
+
     const riskCfg = await this.prisma.risk_config.findFirst();
     if (riskCfg?.global_paused) {
       return { success: false, reason: 'pause_globale' };
@@ -94,10 +144,22 @@ export class ArbitrageService {
       return { token, action: 'skip', reason: 'prix_reference_indisponible' };
     }
 
+    // Taille de ticket réelle (ex. ~$200). On cote CETTE taille en unités de token
+    // plutôt que « 1 token entier » : coter 1 WBTC (~$65 000) sur un pool Arbitrum peu
+    // profond génère un impact de prix massif (~-640 bps) interprété à tort comme une
+    // anomalie. En cotant le notionnel réel, l'écart reflète l'exécution réelle.
+    const tradeUsd = Math.min(ARB_MAX_TRADE_USD, parseFloat(cfg.max_amount_per_arb));
+    const tokenQty = tradeUsd / refPrice; // quantité de token pour ~tradeUsd
+    if (!(tokenQty > 0) || !Number.isFinite(tokenQty)) {
+      return { token, action: 'skip', reason: 'quantite_invalide' };
+    }
+
     let dexPrice = 0;
     try {
-      const q = await this.blockchain.getQuote(token, 'USDC', '1');
-      dexPrice = parseFloat(q.amountOut);
+      // Vend tokenQty token → USDC ; prix effectif = USDC reçus / tokenQty.
+      const q = await this.blockchain.getQuote(token, 'USDC', tokenQty.toFixed(8));
+      const outUsdc = parseFloat(q.amountOut);
+      if (outUsdc > 0) dexPrice = outUsdc / tokenQty;
     } catch (err: any) {
       return { token, action: 'skip', reason: 'quote_onchain_indisponible', detail: err.message };
     }
@@ -117,17 +179,7 @@ export class ArbitrageService {
       return { token, action: 'reject', reason: 'spread_anormal', spreadBps };
     }
 
-    const tradeUsd = Math.min(ARB_MAX_TRADE_USD, parseFloat(cfg.max_amount_per_arb));
     const profitEstimate = (tradeUsd * absSpread) / 10000;
-
-    // Estimation coût gas Arbitrum (2 swaps buy+sell)
-    const gasCostUsd = 0.30;
-    const netProfit = profitEstimate - gasCostUsd;
-    if (netProfit <= 0) {
-      this.logger.log(`Arbitrage ${token}: spread ${absSpread} bps mais profit net $${netProfit.toFixed(2)} <= 0 (gas $${gasCostUsd}) — skip`);
-      return { token, action: 'skip', reason: 'profit_net_negatif', spreadBps, profitEstimate, gasCostUsd, netProfit };
-    }
-
     const dexCheaper = dexPrice < refPrice;
 
     const opp = await this.prisma.arbitrage_opportunity.create({
@@ -143,6 +195,15 @@ export class ArbitrageService {
         status: 'detected',
       },
     });
+
+    // Estimation coût gas Arbitrum (2 swaps buy+sell)
+    const gasCostUsd = 0.30;
+    const netProfit = profitEstimate - gasCostUsd;
+    if (netProfit <= 0) {
+      this.logger.log(`Arbitrage ${token}: spread ${absSpread} bps mais profit net $${netProfit.toFixed(2)} <= 0 (gas $${gasCostUsd}) — skip`);
+      await this.prisma.arbitrage_opportunity.update({ where: { id: opp.id }, data: { status: 'expired' } });
+      return { token, action: 'skip', reason: 'profit_net_negatif', spreadBps, profitEstimate, gasCostUsd, netProfit };
+    }
 
     // On n'exécute que le cas où le token est sous-évalué sur le DEX (achat spot possible).
     if (!dexCheaper) {
@@ -179,8 +240,8 @@ export class ArbitrageService {
       },
     });
 
-    this.logger.log(`Arbitrage ${token}: écart ${absSpread} bps (DEX ${dexPrice} / ref ${refPrice}), profit estimé $${profitEstimate.toFixed(2)}`);
-    return { token, action: 'arbitrage', spreadBps, dexPrice, refPrice, profitEstimate, buyLeg, sellLeg };
+    this.logger.log(`Arbitrage ${token}: écart ${absSpread} bps (DEX ${dexPrice} / ref ${refPrice}), profit brut $${profitEstimate.toFixed(2)} - gas $${gasCostUsd.toFixed(2)} = net $${netProfit.toFixed(2)} → EXÉCUTÉ`);
+    return { token, action: 'arbitrage', spreadBps, dexPrice, refPrice, profitEstimate, gasCostUsd, netProfit, buyLeg, sellLeg };
   }
 
   async getStatus(): Promise<any> {
@@ -190,7 +251,7 @@ export class ArbitrageService {
     });
     return {
       enabled: this.enabled,
-      schedule: '0 */2 * * * * (toutes les 2 min)',
+      schedule: '0 */5 * * * * (toutes les 5 min)',
       minSpreadBps: ARB_MIN_SPREAD_BPS,
       maxSpreadBps: ARB_MAX_SPREAD_BPS,
       maxTradeUsd: ARB_MAX_TRADE_USD,

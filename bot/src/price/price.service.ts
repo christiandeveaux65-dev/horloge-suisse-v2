@@ -22,7 +22,9 @@ export class PriceService {
    * Cascade : cache → KuCoin → dernier prix en DB
    */
   async getPrice(token: string): Promise<number> {
-    const tokenUpper = token.toUpperCase();
+    let tokenUpper = token.toUpperCase();
+    // ETH natif = WETH côté prix (même actif sous-jacent).
+    if (tokenUpper === 'ETH') tokenUpper = 'WETH';
 
     // Stablecoins = 1 USD
     if (tokenUpper === 'USDC' || tokenUpper === 'USDT') return 1;

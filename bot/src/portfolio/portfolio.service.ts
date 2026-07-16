@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { PriceService } from '../price/price.service';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import { CHAIN, TOKENS, STABLECOINS } from '../constants';
@@ -24,15 +25,45 @@ export class PortfolioService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  /** Cron snapshot : toutes les 15 minutes */
-  @Cron('0 */15 * * * *')
+  /** Cron snapshot : toutes les 15 minutes (permet au circuit breaker Risk de détecter les drawdowns rapides) */
+  @Cron('0 */15 * * * *', { timeZone: 'Europe/Paris', name: 'portfolio' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'portfolio', 900000))) return;
     try {
       await this.takeSnapshot();
     } catch (err: any) {
       this.logger.error(`Snapshot portefeuille échoué: ${err.message}`);
     }
+  }
+
+  /** Cron dédié détection wallet ledger : toutes les 30 minutes.
+   *  Récupère les balances on-chain, compare au dernier snapshot connu, journalise
+   *  tout écart non expliqué par les trades du bot dans wallet_ledger. */
+  @Cron('0 */30 * * * *', { timeZone: 'Europe/Paris', name: 'portfolio_ledger' })
+  async handleLedgerCron(): Promise<void> {
+    if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'portfolio_ledger', 1800000))) return;
+    try {
+      await this.detectWalletMovements();
+    } catch (err: any) {
+      this.logger.error(`Détection wallet ledger échouée: ${err.message}`);
+    }
+  }
+
+  /** Détection des mouvements de fonds externes indépendamment du snapshot. */
+  async detectWalletMovements(): Promise<any> {
+    const lastSnap = await this.prisma.portfolio_snapshot.findFirst({
+      orderBy: { snapshot_at: 'desc' },
+    });
+    if (!lastSnap) {
+      return { entries: [], reason: 'aucun_snapshot_prealable' };
+    }
+    const prevTime = new Date(lastSnap.snapshot_at);
+    const balances = await this.blockchain.getAllBalances();
+    const entries = await this.reconcileLedger(prevTime, balances);
+    this.logger.log(`Détection wallet ledger : ${entries.length} mouvement(s) externe(s) détecté(s)`);
+    return { entries, checked_at: new Date() };
   }
 
   /** Prendre un snapshot du portefeuille */
@@ -68,6 +99,34 @@ export class PortfolioService {
       });
 
       snapshots.push(snap);
+    }
+
+    // ── Snapshots synthétiques des positions DeFi actives ──
+    // On enregistre la valeur GMX et Aave dans des lignes dédiées (token GMX_POSITIONS /
+    // AAVE_NET, balance=0) afin que l'agrégation par timestamp du circuit breaker (risk)
+    // inclue le capital DeFi. Ces lignes sont ignorées par la réconciliation (voir garde
+    // sur les tokens synthétiques). En dry-run → valeurs à 0.
+    try {
+      const defi = await this.blockchain.getDefiValueUsd();
+      const defiRows: Array<[string, number]> = [
+        ['GMX_POSITIONS', defi.gmxUsd],
+        ['AAVE_NET', defi.aaveUsd],
+      ];
+      for (const [token, valueUsd] of defiRows) {
+        if (valueUsd <= 0) continue;
+        const snap = await this.prisma.portfolio_snapshot.create({
+          data: {
+            chain: CHAIN,
+            token,
+            balance: '0',
+            price_usd: '0',
+            value_usd: valueUsd.toFixed(2),
+          },
+        });
+        snapshots.push(snap);
+      }
+    } catch (err: any) {
+      this.logger.warn(`Snapshot DeFi indisponible: ${err.message}`);
     }
 
     // R\u00e9conciliation wallet ledger (le\u00e7on #7) : d\u00e9tecter les mouvements de fonds externes.
@@ -112,7 +171,15 @@ export class PortfolioService {
     }
 
     const allTokens = new Set([...Object.keys(currentBalances), ...Object.keys(prevBal)]);
+    // Tokens synthétiques DeFi (GMX_POSITIONS, AAVE_NET) : ce ne sont PAS des soldes ERC20
+    // du wallet mais des lignes de valorisation. On les exclut de la réconciliation pour ne
+    // jamais les signaler comme dépôt/retrait externe.
+    const SYNTHETIC_TOKENS = new Set(['GMX_POSITIONS', 'AAVE_NET']);
+    // ETH natif : consommé par le gas → variation permanente non liée aux trades du bot.
+    // On l'exclut de la réconciliation pour éviter de fausses alertes de retrait externe.
+    const NON_RECONCILED = new Set(['ETH']);
     for (const token of allTokens) {
+      if (SYNTHETIC_TOKENS.has(token) || NON_RECONCILED.has(token)) continue;
       const cur = parseFloat(currentBalances[token] || '0');
       const prev = prevBal[token] || 0;
       const delta = cur - prev;
@@ -184,8 +251,28 @@ export class PortfolioService {
       });
     }
 
+    // ── Valeur des positions DeFi actives (GMX + Aave) ──
+    // Lue directement on-chain (indépendante de l'adoption en base) afin que la valeur
+    // totale reflète le capital RÉEL : wallet ERC20 + collatéral DeFi. En dry-run → 0.
+    const walletValue = totalValue;
+    let defi: any = { gmxUsd: 0, aaveUsd: 0, totalUsd: 0, gmxPositions: [], aave: null };
+    try {
+      defi = await this.blockchain.getDefiValueUsd();
+    } catch (err: any) {
+      this.logger.warn(`Valeur DeFi indisponible: ${err.message}`);
+    }
+    totalValue += defi.totalUsd;
+
     return {
       totalValue,
+      walletValue,
+      defi: {
+        totalUsd: defi.totalUsd,
+        gmxUsd: defi.gmxUsd,
+        aaveUsd: defi.aaveUsd,
+        gmxPositions: defi.gmxPositions,
+        aave: defi.aave,
+      },
       chain: CHAIN,
       tokens,
       timestamp: new Date(),

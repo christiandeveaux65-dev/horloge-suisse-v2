@@ -261,29 +261,6 @@ model ohlcv_candles {
   @@index([token, timeframe, open_time])
 }
 
-model backtest_optimization {
-  id                String   @id @default(uuid())
-  strategy_type     String   // "dca" | "grid" | "mean_reversion" | "momentum"
-  loss_function     String   // "SharpeOptimize" | "SortinoOptimize" | "ProfitMaximize" | "MinDrawdown" | "Balanced"
-  timeframe         String   @default("1h")
-  tokens            String   @default("[]") // JSON array
-  search_method     String   @default("grid") // "grid" | "random" | "hybrid"
-  grid_size         Int      @default(0)   // taille totale de l'espace de recherche
-  iterations_tested Int      @default(0)   // combinaisons réellement évaluées
-  best_params       String   @default("{}") // JSON des meilleurs paramètres
-  best_metrics      String   @default("{}") // JSON métriques in-sample du meilleur
-  oos_metrics       String   @default("{}") // JSON métriques out-of-sample du meilleur
-  wfe               String   @default("0")  // Walk-Forward Efficiency
-  top_results       String   @default("[]") // JSON top 10 combinaisons (params + is/oos)
-  in_sample_period  String   @default("{}") // {start,end}
-  out_sample_period String   @default("{}") // {start,end}
-  status            String   @default("completed")
-  notes             String   @default("")
-  created_at        DateTime @default(now())
-
-  @@index([strategy_type, created_at])
-}
-
 model order {
   id                String    @id @default(uuid())
   kind              String    // "twap" | "limit"

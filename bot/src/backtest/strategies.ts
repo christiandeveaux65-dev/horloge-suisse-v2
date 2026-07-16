@@ -1,0 +1,368 @@
+/**
+ * Moteur de simulation des 4 stratégies du bot (DCA, Grid, Mean Reversion, Momentum).
+ *
+ * Principes :
+ *  - Pas de look-ahead : chaque décision à la bougie i n'utilise que closes[0..i].
+ *    L'exécution se fait au close de la bougie i (avec friction).
+ *  - Frictions réalistes : fees (%) + slippage (%) appliqués à chaque trade.
+ *  - Un portefeuille unique (cash USDT + positions par token) partagé par la stratégie.
+ */
+import { rsi, bollingerBands } from '../indicators';
+import { emaSeries } from './metrics';
+import { Candle, SimTrade, EquityPoint, SimResult } from './backtest.types';
+
+interface Position {
+  amountToken: number;
+  costUsd: number; // base de coût cumulée (friction incluse)
+}
+
+class Portfolio {
+  cash: number;
+  positions: Map<string, Position> = new Map();
+  trades: SimTrade[] = [];
+
+  constructor(
+    initialCapital: number,
+    private readonly feePct: number,
+    private readonly slipPct: number,
+  ) {
+    this.cash = initialCapital;
+  }
+
+  private pos(token: string): Position {
+    let p = this.positions.get(token);
+    if (!p) {
+      p = { amountToken: 0, costUsd: 0 };
+      this.positions.set(token, p);
+    }
+    return p;
+  }
+
+  exposureUsd(token: string): number {
+    return this.pos(token).costUsd;
+  }
+
+  totalExposureUsd(): number {
+    let s = 0;
+    for (const p of this.positions.values()) s += p.costUsd;
+    return s;
+  }
+
+  /** Achat pour `usdToSpend` (notionnel total prélevé sur le cash). */
+  buy(token: string, usdToSpend: number, price: number, time: number, reason?: string): boolean {
+    if (usdToSpend <= 0 || this.cash < usdToSpend || price <= 0) return false;
+    const effPrice = price * (1 + this.slipPct / 100);
+    const fee = usdToSpend * (this.feePct / 100);
+    const tokensReceived = (usdToSpend - fee) / effPrice;
+    if (tokensReceived <= 0) return false;
+    this.cash -= usdToSpend;
+    const p = this.pos(token);
+    p.amountToken += tokensReceived;
+    p.costUsd += usdToSpend;
+    this.trades.push({
+      token, side: 'buy', time, price: effPrice,
+      amountUsd: usdToSpend, amountToken: tokensReceived, feeUsd: fee, reason,
+    });
+    return true;
+  }
+
+  /** Vente de `tokensToSell` tokens (ou tout si non précisé). Calcule le PnL réalisé. */
+  sell(token: string, tokensToSell: number | 'all', price: number, time: number, reason?: string): boolean {
+    const p = this.pos(token);
+    const qty = tokensToSell === 'all' ? p.amountToken : Math.min(tokensToSell, p.amountToken);
+    if (qty <= 0 || price <= 0) return false;
+    const effPrice = price * (1 - this.slipPct / 100);
+    const gross = qty * effPrice;
+    const fee = gross * (this.feePct / 100);
+    const proceeds = gross - fee;
+    const avgCost = p.amountToken > 0 ? p.costUsd / p.amountToken : 0;
+    const costBasis = avgCost * qty;
+    const pnl = proceeds - costBasis;
+    this.cash += proceeds;
+    p.amountToken -= qty;
+    p.costUsd -= costBasis;
+    if (p.amountToken < 1e-12) { p.amountToken = 0; p.costUsd = 0; }
+    this.trades.push({
+      token, side: 'sell', time, price: effPrice,
+      amountUsd: proceeds, amountToken: qty, feeUsd: fee, pnlUsd: pnl, reason,
+    });
+    return true;
+  }
+
+  equity(prices: Record<string, number>): number {
+    let eq = this.cash;
+    for (const [token, p] of this.positions.entries()) {
+      const px = prices[token] ?? 0;
+      eq += p.amountToken * px;
+    }
+    return eq;
+  }
+}
+
+/** Construit la timeline maître (union triée des timestamps de tous les tokens). */
+function masterTimeline(candlesByToken: Map<string, Candle[]>): number[] {
+  const set = new Set<number>();
+  for (const arr of candlesByToken.values()) for (const c of arr) set.add(c.t);
+  return Array.from(set).sort((a, b) => a - b);
+}
+
+/** État par token pour un parcours aligné sur la timeline maître. */
+interface TokenCursor {
+  candles: Candle[];
+  idx: number; // index de la dernière bougie connue (open_time <= t courant)
+  lastPrice: number;
+  closes: number[]; // closes[0..idx]
+  ema?: { short: number[]; long: number[] };
+}
+
+export interface SimConfig {
+  strategy: 'dca' | 'grid' | 'mean_reversion' | 'momentum';
+  tokens: string[];
+  initialCapital: number;
+  feePct: number;
+  slipPct: number;
+  params: Record<string, any>;
+}
+
+export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig): SimResult {
+  const timeline = masterTimeline(candlesByToken);
+  const pf = new Portfolio(cfg.initialCapital, cfg.feePct, cfg.slipPct);
+  const equityCurve: EquityPoint[] = [];
+
+  // Curseurs par token.
+  const cursors = new Map<string, TokenCursor>();
+  for (const [token, candles] of candlesByToken.entries()) {
+    cursors.set(token, { candles, idx: -1, lastPrice: 0, closes: [] });
+  }
+
+  // Pré-calcul EMA (momentum) — emaSeries est incrémental, aucun look-ahead.
+  if (cfg.strategy === 'momentum') {
+    const emaShort = Math.max(2, parseInt(cfg.params.emaShort ?? 10, 10));
+    const emaLong = Math.max(3, parseInt(cfg.params.emaLong ?? 30, 10));
+    for (const cur of cursors.values()) {
+      const closesFull = cur.candles.map((c) => c.close);
+      cur.ema = { short: emaSeries(closesFull, emaShort), long: emaSeries(closesFull, emaLong) };
+    }
+  }
+
+  // État spécifique DCA / Grid.
+  let lastDcaBuy = 0;
+  const gridState: { center: number; boughtLevels: Set<number>; lastLevel: number | null } = {
+    center: 0, boughtLevels: new Set(), lastLevel: null,
+  };
+
+  for (const t of timeline) {
+    // Avancer les curseurs jusqu'à t.
+    for (const cur of cursors.values()) {
+      while (cur.idx + 1 < cur.candles.length && cur.candles[cur.idx + 1].t <= t) {
+        cur.idx++;
+        cur.lastPrice = cur.candles[cur.idx].close;
+        cur.closes.push(cur.candles[cur.idx].close);
+      }
+    }
+    const prices: Record<string, number> = {};
+    for (const [token, cur] of cursors.entries()) prices[token] = cur.lastPrice;
+
+    switch (cfg.strategy) {
+      case 'dca':
+        lastDcaBuy = stepDca(pf, cfg, cursors, t, prices, lastDcaBuy);
+        break;
+      case 'grid':
+        stepGrid(pf, cfg, cursors, t, gridState);
+        break;
+      case 'mean_reversion':
+        stepMeanReversion(pf, cfg, cursors, t);
+        break;
+      case 'momentum':
+        stepMomentum(pf, cfg, cursors, t);
+        break;
+    }
+
+    equityCurve.push({ t, equity: pf.equity(prices) });
+  }
+
+  return { trades: pf.trades, equityCurve };
+}
+
+// ─────────────────────────────── DCA ───────────────────────────────
+function stepDca(
+  pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>,
+  t: number, prices: Record<string, number>, lastBuy: number,
+): number {
+  const amountPerBuy = parseFloat(cfg.params.amountPerBuy ?? 50);
+  const intervalHours = parseFloat(cfg.params.intervalHours ?? 24);
+  const intervalMs = intervalHours * 3600 * 1000;
+  // Panier : poids fournis, sinon équipondéré sur les tokens sélectionnés.
+  const basket: { token: string; weight: number }[] =
+    Array.isArray(cfg.params.basket) && cfg.params.basket.length
+      ? cfg.params.basket
+      : cfg.tokens.map((tk) => ({ token: tk, weight: 1 / cfg.tokens.length }));
+
+  if (lastBuy === 0) lastBuy = t; // ancre le premier achat au début de la période
+  if (t - lastBuy < intervalMs && pf.trades.length > 0) return lastBuy;
+  if (t - lastBuy < intervalMs && pf.trades.length === 0 && lastBuy !== t) return lastBuy;
+  if (t - lastBuy < intervalMs) return lastBuy;
+
+  for (const leg of basket) {
+    const cur = cursors.get(leg.token);
+    if (!cur || cur.idx < 0 || cur.lastPrice <= 0) continue;
+    const spend = amountPerBuy * leg.weight;
+    if (pf.cash < spend) continue;
+    pf.buy(leg.token, spend, cur.lastPrice, t, 'dca');
+  }
+  return t;
+}
+
+// ─────────────────────────────── Grid ──────────────────────────────
+function stepGrid(
+  pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>,
+  t: number, state: { center: number; boughtLevels: Set<number>; lastLevel: number | null },
+) {
+  const token = (cfg.params.token ?? cfg.tokens[0] ?? 'WETH').toUpperCase();
+  const cur = cursors.get(token);
+  if (!cur || cur.idx < 0 || cur.lastPrice <= 0) return;
+  const price = cur.lastPrice;
+  const budget = parseFloat(cfg.params.budgetUsd ?? 1000);
+  const levels = Math.max(2, parseInt(cfg.params.levels ?? 15, 10));
+  const rangePct = parseFloat(cfg.params.rangePct ?? 3.5);
+  const perLevel = budget / levels;
+
+  // Initialisation / recentrage (drift > 5 %, comme le bot réel).
+  if (state.center === 0) state.center = price;
+  const drift = Math.abs(price - state.center) / state.center;
+  if (drift > 0.05) {
+    state.center = price;
+    state.boughtLevels.clear();
+    state.lastLevel = null;
+  }
+
+  const lower = state.center * (1 - rangePct / 100);
+  const upper = state.center * (1 + rangePct / 100);
+  const step = (upper - lower) / levels;
+  if (step <= 0) return;
+
+  const level = Math.floor((price - lower) / step);
+  const prev = state.lastLevel;
+  state.lastLevel = level;
+  if (prev === null) return;
+
+  if (level < prev) {
+    // Franchissement à la baisse : acheter aux niveaux nouvellement franchis (moitié basse).
+    for (let l = prev - 1; l >= Math.max(0, level); l--) {
+      if (l >= Math.floor(levels / 2)) continue; // n'acheter que dans la moitié basse
+      if (state.boughtLevels.has(l)) continue;
+      if (pf.totalExposureUsd() + perLevel > budget) break;
+      const buyPrice = lower + l * step;
+      if (pf.buy(token, perLevel, buyPrice, t, `grid_buy_L${l}`)) state.boughtLevels.add(l);
+    }
+  } else if (level > prev) {
+    // Franchissement à la hausse : vendre les lots achetés en dessous (FIFO niveaux bas).
+    const sorted = Array.from(state.boughtLevels).sort((a, b) => a - b);
+    for (const l of sorted) {
+      if (l >= level) break; // vendre seulement les lots sous le niveau courant
+      const sellPrice = Math.max(lower + (l + 1) * step, price);
+      const p = pf['positions'].get(token);
+      if (!p || p.amountToken <= 0) break;
+      const lotTokens = p.amountToken / Math.max(1, state.boughtLevels.size);
+      if (pf.sell(token, lotTokens, sellPrice, t, `grid_sell_L${l}`)) state.boughtLevels.delete(l);
+    }
+  }
+}
+
+// ─────────────────────── Mean Reversion (RSI + BB) ─────────────────
+function stepMeanReversion(
+  pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>, t: number,
+) {
+  const rsiPeriod = parseInt(cfg.params.rsiPeriod ?? 14, 10);
+  const oversold = parseFloat(cfg.params.rsiOversold ?? 35);
+  const overbought = parseFloat(cfg.params.rsiOverbought ?? 75);
+  const bbPeriod = parseInt(cfg.params.bbPeriod ?? 20, 10);
+  const bbStd = parseFloat(cfg.params.bbStdDev ?? 2.5);
+  const tradeSize = parseFloat(cfg.params.tradeSizeUsd ?? 100);
+  const maxPerToken = parseFloat(cfg.params.maxPerToken ?? 400);
+  const maxTotal = parseFloat(cfg.params.maxTotal ?? 800);
+
+  for (const [token, cur] of cursors.entries()) {
+    if (cur.idx < 0 || cur.lastPrice <= 0) continue;
+    if (cur.closes.length < Math.max(rsiPeriod + 1, bbPeriod)) continue;
+    const price = cur.lastPrice;
+    const rsiVal = rsi(cur.closes, rsiPeriod);
+    const bands = bollingerBands(cur.closes, bbPeriod, bbStd);
+    const p = pf['positions'].get(token);
+    const hasPos = p && p.amountToken > 0;
+
+    // Sortie : RSI en surachat.
+    if (hasPos && rsiVal >= overbought) {
+      pf.sell(token, 'all', price, t, 'mr_rsi_overbought');
+      continue;
+    }
+    // Entrée : RSI survendu ET prix sous la bande inférieure.
+    const entry = bands && rsiVal <= oversold && price < bands.lower;
+    if (entry) {
+      if (pf.totalExposureUsd() >= maxTotal) continue;
+      if (pf.exposureUsd(token) >= maxPerToken) continue;
+      const size = Math.min(tradeSize, maxTotal - pf.totalExposureUsd(), maxPerToken - pf.exposureUsd(token));
+      if (size >= 5) pf.buy(token, size, price, t, 'mr_entry');
+    }
+  }
+}
+
+// ─────────────────────── Momentum (EMA crossover) ──────────────────
+function stepMomentum(
+  pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>, t: number,
+) {
+  const positionSizeUsd = parseFloat(
+    cfg.params.positionSizeUsd ?? cfg.initialCapital / Math.max(1, cfg.tokens.length),
+  );
+  const stopLossPct = parseFloat(cfg.params.stopLossPct ?? 0); // 0 = désactivé
+
+  for (const [token, cur] of cursors.entries()) {
+    if (cur.idx < 1 || !cur.ema || cur.lastPrice <= 0) continue;
+    const i = cur.idx;
+    const sNow = cur.ema.short[i];
+    const lNow = cur.ema.long[i];
+    const sPrev = cur.ema.short[i - 1];
+    const lPrev = cur.ema.long[i - 1];
+    const price = cur.lastPrice;
+    const p = pf['positions'].get(token);
+    const hasPos = p && p.amountToken > 0;
+
+    // Stop-loss : sortie si le prix chute sous le coût moyen d'entrée.
+    if (hasPos && stopLossPct > 0) {
+      const avgCost = p!.costUsd / p!.amountToken;
+      if (avgCost > 0 && price <= avgCost * (1 - stopLossPct / 100)) {
+        pf.sell(token, 'all', price, t, 'mom_stop_loss');
+        continue;
+      }
+    }
+
+    const crossUp = sPrev <= lPrev && sNow > lNow;
+    const crossDown = sPrev >= lPrev && sNow < lNow;
+
+    if (crossUp && !hasPos) {
+      const size = Math.min(positionSizeUsd, pf.cash);
+      if (size >= 5) pf.buy(token, size, price, t, 'mom_cross_up');
+    } else if (crossDown && hasPos) {
+      pf.sell(token, 'all', price, t, 'mom_cross_down');
+    }
+  }
+}
+
+/** Équité finale d'un buy&hold équipondéré (référence de comparaison). */
+export function buyHoldFinal(
+  candlesByToken: Map<string, Candle[]>, initialCapital: number,
+): number {
+  const tokens = Array.from(candlesByToken.keys()).filter(
+    (tk) => (candlesByToken.get(tk) ?? []).length > 0,
+  );
+  if (tokens.length === 0) return initialCapital;
+  const alloc = initialCapital / tokens.length;
+  let final = 0;
+  for (const tk of tokens) {
+    const arr = candlesByToken.get(tk)!;
+    const first = arr[0].close;
+    const last = arr[arr.length - 1].close;
+    if (first > 0) final += alloc * (last / first);
+  }
+  return final;
+}

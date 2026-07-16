@@ -232,55 +232,6 @@ model backtest {
   notes             String   @default("")
   created_at        DateTime @default(now())
 
-  // ─── Champs additionnels (backtesting pro) ───
-  timeframe         String   @default("1h")
-  sortino_ratio     String   @default("0")
-  calmar_ratio      String   @default("0")
-  profit_factor     String   @default("0")
-  max_dd_duration   String   @default("0") // durée max drawdown en jours
-  fees_pct          String   @default("0.3")
-  slippage_pct      String   @default("0.1")
-
-  @@index([strategy_type, created_at])
-}
-
-// ─── Bougies OHLCV historiques (backtesting) ───
-model ohlcv_candles {
-  id         String   @id @default(uuid())
-  token      String   // symbole interne : WETH, WBTC, ARB, LINK, PENDLE, GMX, UNI
-  timeframe  String   // "1h" | "4h"
-  open_time  DateTime // début de la bougie (UTC)
-  open       String
-  high       String
-  low        String
-  close      String
-  volume     String   @default("0")
-  created_at DateTime @default(now())
-
-  @@unique([token, timeframe, open_time])
-  @@index([token, timeframe, open_time])
-}
-
-model backtest_optimization {
-  id                String   @id @default(uuid())
-  strategy_type     String   // "dca" | "grid" | "mean_reversion" | "momentum"
-  loss_function     String   // "SharpeOptimize" | "SortinoOptimize" | "ProfitMaximize" | "MinDrawdown" | "Balanced"
-  timeframe         String   @default("1h")
-  tokens            String   @default("[]") // JSON array
-  search_method     String   @default("grid") // "grid" | "random" | "hybrid"
-  grid_size         Int      @default(0)   // taille totale de l'espace de recherche
-  iterations_tested Int      @default(0)   // combinaisons réellement évaluées
-  best_params       String   @default("{}") // JSON des meilleurs paramètres
-  best_metrics      String   @default("{}") // JSON métriques in-sample du meilleur
-  oos_metrics       String   @default("{}") // JSON métriques out-of-sample du meilleur
-  wfe               String   @default("0")  // Walk-Forward Efficiency
-  top_results       String   @default("[]") // JSON top 10 combinaisons (params + is/oos)
-  in_sample_period  String   @default("{}") // {start,end}
-  out_sample_period String   @default("{}") // {start,end}
-  status            String   @default("completed")
-  notes             String   @default("")
-  created_at        DateTime @default(now())
-
   @@index([strategy_type, created_at])
 }
 

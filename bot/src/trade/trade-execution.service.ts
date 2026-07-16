@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { BlockchainService, SwapResult } from '../blockchain/blockchain.service';
 import { PriceService } from '../price/price.service';
+import { TelegramService } from '../telegram/telegram.service';
 import {
   CHAIN, SPLIT_ORDER_THRESHOLD_USD, SPLIT_TRANCHE_DELAY_MS,
   MAX_SPLIT_TRANCHES, DEFAULT_SLIPPAGE_BPS,
@@ -42,6 +43,7 @@ export class TradeExecutionService {
     private readonly prisma: PrismaService,
     private readonly blockchain: BlockchainService,
     private readonly priceService: PriceService,
+    private readonly telegram: TelegramService,
   ) {}
 
   /**
@@ -115,6 +117,20 @@ export class TradeExecutionService {
     this.logger.log(
       `Trade ${trade.id} journalisé : ${status} | ${req.amountIn} ${req.sourceToken} → ${swapResult.amountOut} ${req.targetToken}`,
     );
+
+    // Notification Telegram (fire-and-forget, ne bloque jamais le trading)
+    this.telegram.notifyTrade({
+      tradeId: trade.id,
+      source: req.source,
+      side: req.side,
+      sourceToken: req.sourceToken,
+      targetToken: req.targetToken,
+      amountIn: swapResult.amountIn,
+      amountOut: swapResult.amountOut,
+      status,
+      txHash: swapResult.txHash,
+      error: swapResult.error,
+    });
 
     return {
       success: swapResult.success,

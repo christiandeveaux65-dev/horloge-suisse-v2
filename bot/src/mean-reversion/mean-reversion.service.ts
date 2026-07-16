@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
 import { rsi, bollingerBands } from '../indicators';
@@ -12,10 +13,10 @@ import {
  * Mean Reversion — RSI(14) + Bollinger Bands
  * Achat si RSI < 30 ET prix sous bande inférieure
  * Vente si RSI > 70
- * LIMITES HARDCODÉES : $75/trade, $300/token, $600 total
+ * LIMITES HARDCODÉES (Phase 2) : $100/trade, $400/token, $1000 total.
  */
 @Injectable()
-export class MeanReversionService {
+export class MeanReversionService implements OnModuleInit {
   private readonly logger = new Logger(MeanReversionService.name);
   private enabled = true;
 
@@ -28,9 +29,57 @@ export class MeanReversionService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  @Cron('0 */10 * * * *')
+  /**
+   * Phase 2 : crée la config Mean Reversion par défaut si absente.
+   * ARB/PENDLE/GMX, budget $1000, BB 20/2.5, RSI 25/75, SL 6%, TP 8%.
+   */
+  async onModuleInit(): Promise<void> {
+    try {
+      const existing = await this.prisma.mean_reversion_config.findFirst({ where: { name: 'Mean Reversion Principal' } });
+      if (!existing) {
+        await this.prisma.mean_reversion_config.create({
+          data: {
+            name: 'Mean Reversion Principal',
+            chain: CHAIN,
+            tokens: 'ARB,PENDLE,GMX',
+            budget_usd: '1000',
+            bb_period: 20,
+            bb_std_dev: '2.5',
+            rsi_period: 14,
+            rsi_oversold: 25,
+            rsi_overbought: 75,
+            stop_loss_pct: 6,
+            take_profit_pct: 8,
+            active: true,
+            paused: false,
+          },
+        });
+        this.logger.log('MR config créée : ARB/PENDLE/GMX, budget $1000, BB 20/2.5, RSI 25/75, SL 6%, TP 8%');
+      }
+    } catch (err: any) {
+      this.logger.error(`MR onModuleInit: ${err.message}`);
+    }
+  }
+
+  /** Récupère le multiplicateur MR du coupling. 0 = stratégie coupée (surchauffe). */
+  private async getCouplingMultiplier(): Promise<number> {
+    const decision = await this.prisma.coupling_decision.findFirst({
+      where: { kind: 'mean_reversion_modulation' },
+      orderBy: { created_at: 'desc' },
+    });
+    if (!decision) return 1;
+    try {
+      const payload = JSON.parse(decision.payload);
+      const mult = parseFloat(payload.multiplier);
+      if (Number.isFinite(mult) && mult >= 0 && mult <= 2) return mult;
+    } catch {}
+    return 1;
+  }
+
+  @Cron('0 */10 * * * *', { timeZone: 'Europe/Paris', name: 'mean_reversion' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'mean_reversion', 600000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {
@@ -44,6 +93,9 @@ export class MeanReversionService {
       return { success: false, reason: 'pause_globale' };
     }
 
+    // Coupling : mult MR (0 = surchauffe, coupe les entrées ; gestion positions conservée).
+    const couplingMult = await this.getCouplingMultiplier();
+
     const configs = await this.prisma.mean_reversion_config.findMany({
       where: { active: true, paused: false },
     });
@@ -53,7 +105,7 @@ export class MeanReversionService {
       const tokens = cfg.tokens.split(',').map((t: string) => t.trim().toUpperCase());
       for (const token of tokens) {
         try {
-          const result = await this.processToken(cfg, token, riskCfg);
+          const result = await this.processToken(cfg, token, riskCfg, couplingMult);
           results.push(result);
         } catch (err: any) {
           results.push({ token, error: err.message });
@@ -61,10 +113,10 @@ export class MeanReversionService {
       }
     }
 
-    return { results };
+    return { results, couplingMultiplier: couplingMult };
   }
 
-  private async processToken(cfg: any, token: string, riskCfg: any): Promise<any> {
+  private async processToken(cfg: any, token: string, riskCfg: any, couplingMult: number = 1): Promise<any> {
     // Série de prix
     const prices = await this.priceService.getPriceSeries(token, 50);
     if (prices.length < cfg.bb_period) {
@@ -102,6 +154,11 @@ export class MeanReversionService {
       return { token, action: 'hold', rsi: rsiVal, price: currentPrice };
     }
 
+    // Coupling surchauffe → mult=0 → coupe les entrées MR.
+    if (couplingMult <= 0) {
+      return { token, action: 'skip', reason: 'coupling_surchauffe' };
+    }
+
     // Vérifier les limites hardcodées
     const totalExposure = await this.getTotalExposure();
     if (totalExposure >= MAX_TOTAL_EXPOSURE_MR) {
@@ -124,6 +181,13 @@ export class MeanReversionService {
     if (riskCfg?.recovery_mode) {
       sizeUsd = sizeUsd * (parseFloat(riskCfg.recovery_factor) || 0.5);
     }
+
+    // Coupling boost (capitulation ×1.5). Le plafond dur MAX_TRADE_SIZE_MR est réappliqué ci-dessous.
+    if (couplingMult > 0 && couplingMult !== 1) {
+      sizeUsd = sizeUsd * couplingMult;
+    }
+    // Re-plafonnement dur après boost coupling (aucune borne ne peut être dépassée).
+    sizeUsd = Math.min(sizeUsd, MAX_TRADE_SIZE_MR);
 
     sizeUsd = Math.floor(sizeUsd * 100) / 100;
     if (sizeUsd < 5) {

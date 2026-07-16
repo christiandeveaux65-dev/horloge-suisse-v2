@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { PriceService } from '../price/price.service';
 import { realizedVolatility, rsi, sma } from '../indicators';
 import { CHAIN, TOKENS, STABLECOINS } from '../constants';
@@ -23,9 +24,10 @@ export class MarketIntelligenceService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  @Cron('0 */10 * * * *')
+  @Cron('0 */10 * * * *', { timeZone: 'Europe/Paris', name: 'market' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'market', 600000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {

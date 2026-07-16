@@ -15,6 +15,10 @@ import { ArbitrageModule } from '../arbitrage/arbitrage.module';
 import { GmxModule } from '../gmx/gmx.module';
 import { AaveModule } from '../aave/aave.module';
 import { StrategistModule } from '../strategist/strategist.module';
+import { FlashLoanModule } from '../flash-loan/flash-loan.module';
+import { BasisTradingModule } from '../basis-trading/basis-trading.module';
+import { StablecoinYieldModule } from '../stablecoin-yield/stablecoin-yield.module';
+import { BacktestModule } from '../backtest/backtest.module';
 
 @Module({
   imports: [
@@ -33,6 +37,10 @@ import { StrategistModule } from '../strategist/strategist.module';
     GmxModule,
     AaveModule,
     StrategistModule,
+    FlashLoanModule,
+    BasisTradingModule,
+    StablecoinYieldModule,
+    BacktestModule,
   ],
   controllers: [ApiController],
 })

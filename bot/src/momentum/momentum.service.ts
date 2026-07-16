@@ -1,8 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
+import { BlockchainService } from '../blockchain/blockchain.service';
 import { computeSignal, IndicatorSnapshot } from '../indicators';
 import {
   CHAIN, MOMENTUM_ALTS_SIZE_USD, MOMENTUM_BC_SIZE_USD,
@@ -15,7 +17,7 @@ import {
  * Cron toutes les 5 minutes
  */
 @Injectable()
-export class MomentumService {
+export class MomentumService implements OnModuleInit {
   private readonly logger = new Logger(MomentumService.name);
   private enabled = true;
 
@@ -23,14 +25,206 @@ export class MomentumService {
     private readonly prisma: PrismaService,
     private readonly tradeExecution: TradeExecutionService,
     private readonly priceService: PriceService,
+    private readonly blockchain: BlockchainService,
   ) {}
+
+  /**
+   * Réconcilie le montant à vendre avec le solde on-chain réel.
+   * - Retourne le montant vendable (min entre demandé et solde réel).
+   * - Si plusieurs positions ouvertes partagent le même token, répartit le solde
+   *   proportionnellement à la part réclamée par CETTE position.
+   * - Retourne 0 si le solde on-chain est négligeable (position fantôme).
+   */
+  private async reconcileSellAmount(
+    token: string,
+    positionId: string,
+    requestedAmount: number,
+  ): Promise<{ sellable: number; onChainBalance: number; claimedTotal: number; isPhantom: boolean }> {
+    let onChainBalance = 0;
+    try {
+      const { formatted } = await this.blockchain.getBalance(token);
+      onChainBalance = parseFloat(formatted) || 0;
+    } catch (err: any) {
+      this.logger.warn(`reconcileSellAmount: solde ${token} indisponible: ${err.message}`);
+      return { sellable: 0, onChainBalance: 0, claimedTotal: 0, isPhantom: true };
+    }
+
+    // Somme des montants réclamés par toutes les positions momentum ouvertes sur ce token
+    const openPositions = await this.prisma.position.findMany({
+      where: { token, status: 'open' },
+      select: { id: true, amount_token: true },
+    });
+    const claimedTotal = openPositions.reduce(
+      (sum: number, p: any) => sum + (parseFloat(p.amount_token) || 0),
+      0,
+    );
+
+    // Seuil poussière : 0.0001 % du montant demandé, ou 1e-8 absolu
+    const dustThreshold = Math.max(requestedAmount * 1e-6, 1e-8);
+    if (onChainBalance <= dustThreshold) {
+      return { sellable: 0, onChainBalance, claimedTotal, isPhantom: true };
+    }
+
+    let sellable = Math.min(requestedAmount, onChainBalance);
+
+    // Si le total réclamé dépasse le solde, répartir proportionnellement
+    if (claimedTotal > onChainBalance && claimedTotal > 0) {
+      const share = requestedAmount / claimedTotal;
+      sellable = Math.min(sellable, onChainBalance * share);
+    }
+
+    // Marge de sécurité 0.1 % pour éviter les erreurs d'arrondi on-chain
+    sellable = sellable * 0.999;
+    if (sellable <= dustThreshold) {
+      return { sellable: 0, onChainBalance, claimedTotal, isPhantom: true };
+    }
+
+    return { sellable, onChainBalance, claimedTotal, isPhantom: false };
+  }
+
+  /**
+   * Marque une position comme fantôme (aucun solde on-chain correspondant).
+   * Ne déclenche PAS de trade — nettoie uniquement l'état DB.
+   */
+  private async markPositionAsPhantom(cfg: any, pos: any, reason: string): Promise<void> {
+    await this.prisma.$transaction(async (tx: any) => {
+      await tx.position.update({
+        where: { id: pos.id },
+        data: {
+          status: 'phantom',
+          closed_at: new Date(),
+          amount_token: '0',
+        },
+      });
+      const row = await tx.momentum_config.findUnique({ where: { id: cfg.id } });
+      const deployed = parseFloat(row?.deployed_usd ?? '0');
+      const cost = parseFloat(pos.cost_usd);
+      await tx.momentum_config.update({
+        where: { id: cfg.id },
+        data: { deployed_usd: Math.max(0, deployed - cost).toFixed(2) },
+      });
+    });
+    this.logger.warn(
+      `Position ${pos.token} (id=${pos.id}) marquée FANTÔME : ${reason}. Aucun solde on-chain — nettoyage DB uniquement.`,
+    );
+  }
+
+  /**
+   * Nettoie toutes les positions fantômes (solde on-chain nul ou négligeable).
+   * Peut être déclenché manuellement via l'API.
+   */
+  async cleanupPhantomPositions(): Promise<{ scanned: number; phantoms: any[]; kept: number }> {
+    const openPositions = await this.prisma.position.findMany({
+      where: { status: 'open' },
+      include: { config: true },
+    });
+    const phantoms: any[] = [];
+    let kept = 0;
+
+    // Grouper par token pour minimiser les appels balanceOf
+    const balancesCache: Record<string, number> = {};
+
+    for (const pos of openPositions) {
+      const token = pos.token;
+      if (!(token in balancesCache)) {
+        try {
+          const { formatted } = await this.blockchain.getBalance(token);
+          balancesCache[token] = parseFloat(formatted) || 0;
+        } catch (err: any) {
+          this.logger.warn(`cleanup: solde ${token} indisponible: ${err.message}`);
+          balancesCache[token] = -1; // sentinelle : on ne peut pas juger
+        }
+      }
+      const balance = balancesCache[token];
+      const claimed = parseFloat(pos.amount_token) || 0;
+
+      if (balance < 0) {
+        kept++;
+        continue; // solde indisponible → on ne touche pas
+      }
+
+      const dustThreshold = Math.max(claimed * 1e-6, 1e-8);
+      if (balance <= dustThreshold) {
+        await this.markPositionAsPhantom(pos.config, pos, `solde on-chain=${balance}, réclamé=${claimed}`);
+        phantoms.push({
+          id: pos.id,
+          token: pos.token,
+          config: pos.config?.name,
+          claimed_amount: claimed,
+          on_chain_balance: balance,
+          cost_usd: pos.cost_usd,
+        });
+      } else {
+        kept++;
+      }
+    }
+
+    return { scanned: openPositions.length, phantoms, kept };
+  }
 
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  @Cron('0 */5 * * * *')
+  /**
+   * Phase 2 : crée les 2 configs Momentum par défaut si elles n'existent pas encore.
+   *   • Alts Volatils : ARB/LINK/UNI, budget $1500, SMA 10/30, RSI 30/70, SL 8%, TP 30/60/100%
+   *   • Blue Chips   : WETH/WBTC,     budget $1000, SMA 20/50, RSI 35/65, SL 5%, TP 20/40/80%
+   */
+  async onModuleInit(): Promise<void> {
+    try {
+      const specs = [
+        {
+          name: 'Momentum Alts Volatils',
+          tokens: 'ARB,LINK,UNI',
+          budget_usd: '1500',
+          ma_short: 10, ma_long: 30,
+          rsi_period: 14, rsi_oversold: 30, rsi_overbought: 70,
+          stop_loss_pct: 8,
+          take_profit_levels: '30,60,100',
+        },
+        {
+          name: 'Momentum Blue Chips',
+          tokens: 'WETH,WBTC',
+          budget_usd: '1000',
+          ma_short: 20, ma_long: 50,
+          rsi_period: 14, rsi_oversold: 35, rsi_overbought: 65,
+          stop_loss_pct: 5,
+          take_profit_levels: '20,40,80',
+        },
+      ];
+      for (const spec of specs) {
+        const existing = await this.prisma.momentum_config.findFirst({ where: { name: spec.name } });
+        if (!existing) {
+          await this.prisma.momentum_config.create({
+            data: { ...spec, chain: CHAIN, active: true, paused: false },
+          });
+          this.logger.log(`Momentum config créée : "${spec.name}" (${spec.tokens}, budget $${spec.budget_usd})`);
+        }
+      }
+    } catch (err: any) {
+      this.logger.error(`Momentum onModuleInit: ${err.message}`);
+    }
+  }
+
+  /** Récupère le multiplicateur momentum du coupling. 0 = stratégie coupée (capitulation). */
+  private async getCouplingMultiplier(): Promise<number> {
+    const decision = await this.prisma.coupling_decision.findFirst({
+      where: { kind: 'momentum_modulation' },
+      orderBy: { created_at: 'desc' },
+    });
+    if (!decision) return 1;
+    try {
+      const payload = JSON.parse(decision.payload);
+      const mult = parseFloat(payload.multiplier);
+      if (Number.isFinite(mult) && mult >= 0 && mult <= 2) return mult;
+    } catch {}
+    return 1;
+  }
+
+  @Cron('0 */5 * * * *', { timeZone: 'Europe/Paris', name: 'momentum' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'momentum', 300000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {
@@ -44,6 +238,9 @@ export class MomentumService {
       return { success: false, reason: 'pause_globale' };
     }
 
+    // Coupling : récupérer le multiplicateur momentum (0 = capitulation, coupe les entrées).
+    const couplingMult = await this.getCouplingMultiplier();
+
     const configs = await this.prisma.momentum_config.findMany({
       where: { active: true, paused: false },
     });
@@ -51,7 +248,7 @@ export class MomentumService {
     const results: any[] = [];
     for (const cfg of configs) {
       try {
-        const result = await this.processConfig(cfg, riskCfg);
+        const result = await this.processConfig(cfg, riskCfg, couplingMult);
         results.push(result);
       } catch (err: any) {
         this.logger.error(`Momentum config ${cfg.name} échoué: ${err.message}`);
@@ -59,10 +256,10 @@ export class MomentumService {
       }
     }
 
-    return { results };
+    return { results, couplingMultiplier: couplingMult };
   }
 
-  private async processConfig(cfg: any, riskCfg: any): Promise<any> {
+  private async processConfig(cfg: any, riskCfg: any, couplingMult: number = 1): Promise<any> {
     const tokens = cfg.tokens.split(',').map((t: string) => t.trim().toUpperCase());
     const results: any[] = [];
 
@@ -95,7 +292,12 @@ export class MomentumService {
 
       // Ouverture de nouvelle position si signal buy
       if (snap.signal === 'buy' && snap.latestPrice) {
-        const result = await this.tryOpenPosition(cfg, token, snap, riskCfg);
+        // Coupling capitulation → mult=0 → on coupe les entrées (gestion des positions ouvertes conservée).
+        if (couplingMult <= 0) {
+          results.push({ token, action: 'skip', reason: 'coupling_capitulation' });
+          continue;
+        }
+        const result = await this.tryOpenPosition(cfg, token, snap, riskCfg, couplingMult);
         results.push(result);
       }
     }
@@ -168,6 +370,22 @@ export class MomentumService {
     if (tpHits.length + 1 >= numLevels) sellAmount = currentAmount;
     if (sellAmount > currentAmount) sellAmount = currentAmount;
 
+    // Réconciliation on-chain avant la vente
+    const rec = await this.reconcileSellAmount(pos.token, pos.id, sellAmount);
+    if (rec.isPhantom) {
+      await this.markPositionAsPhantom(
+        cfg, pos,
+        `TP niveau ${level} annulé — solde on-chain=${rec.onChainBalance}, demandé=${sellAmount}`,
+      );
+      return { action: 'phantom_detected', token: pos.token, price, reason: 'no_on_chain_balance' };
+    }
+    if (rec.sellable < sellAmount) {
+      this.logger.warn(
+        `TP ${pos.token}: plafonnement ${sellAmount} → ${rec.sellable} (solde on-chain=${rec.onChainBalance})`,
+      );
+      sellAmount = rec.sellable;
+    }
+
     // Exécuter la vente partielle
     const result = await this.tradeExecution.executeTrade({
       source: 'momentum',
@@ -209,13 +427,38 @@ export class MomentumService {
     const amount = parseFloat(pos.amount_token);
     if (amount <= 0) return { action: 'skip', reason: 'position_vide' };
 
+    // Réconciliation on-chain avant la vente (évite les erreurs STF)
+    const rec = await this.reconcileSellAmount(pos.token, pos.id, amount);
+    if (rec.isPhantom) {
+      await this.markPositionAsPhantom(
+        cfg, pos,
+        `${reason} annulé — solde on-chain=${rec.onChainBalance}, demandé=${amount}`,
+      );
+      return { action: 'phantom_detected', token: pos.token, price, reason: 'no_on_chain_balance' };
+    }
+    const sellAmount = rec.sellable < amount ? rec.sellable : amount;
+    if (rec.sellable < amount) {
+      this.logger.warn(
+        `Close ${pos.token}: plafonnement ${amount} → ${sellAmount} (solde on-chain=${rec.onChainBalance})`,
+      );
+    }
+
     const result = await this.tradeExecution.executeTrade({
       source: 'momentum',
       sourceToken: pos.token,
       targetToken: 'USDC',
-      amountIn: amount.toFixed(8),
+      amountIn: sellAmount.toFixed(8),
       side: 'sell',
     });
+
+    // Ne PAS marquer la position comme fermée si le trade a échoué
+    // (sinon on perd la trace du solde on-chain qui reste dans le wallet)
+    if (!result.success) {
+      this.logger.error(
+        `closePosition ${pos.token} : trade ÉCHOUÉ (${result.error || 'unknown'}). Position laissée ouverte pour retry.`,
+      );
+      return { action: 'close_failed', token: pos.token, price, reason, error: result.error };
+    }
 
     await this.prisma.$transaction(async (tx: any) => {
       await tx.position.update({
@@ -236,7 +479,7 @@ export class MomentumService {
   }
 
   private async tryOpenPosition(
-    cfg: any, token: string, snap: IndicatorSnapshot, riskCfg: any,
+    cfg: any, token: string, snap: IndicatorSnapshot, riskCfg: any, couplingMult: number = 1,
   ): Promise<any> {
     // Compter les positions ouvertes
     const openCount = await this.prisma.position.count({
@@ -274,6 +517,11 @@ export class MomentumService {
     if (riskCfg?.recovery_mode) {
       const recoveryFactor = parseFloat(riskCfg.recovery_factor) || 0.5;
       sizeUsd = sizeUsd * recoveryFactor;
+    }
+
+    // Coupling : boost/frein selon régime de marché
+    if (couplingMult > 0 && couplingMult !== 1) {
+      sizeUsd = sizeUsd * couplingMult;
     }
 
     // Plafonnement par budget restant

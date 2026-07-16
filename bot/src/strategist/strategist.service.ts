@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { STRATEGIST_PARAM_MIN_FACTOR, STRATEGIST_PARAM_MAX_FACTOR } from '../constants';
 
 /**
@@ -21,9 +22,10 @@ export class StrategistService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  @Cron('0 0 */4 * * *')
+  @Cron('0 0 */4 * * *', { timeZone: 'Europe/Paris', name: 'strategist' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'strategist', 14400000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {
@@ -59,7 +61,7 @@ export class StrategistService {
 
     const perf = this.summarize(trades, snapshots);
 
-    // 2. Recommandation (LLM défensif -> fallback déterministe)
+    // 2. Recommandation (LLM défensif -> fallback déterministe enrichi)
     let recommendation = await this.askLlm(perf, regimes).catch((e) => {
       this.logger.warn(`LLM indisponible, fallback déterministe: ${e.message}`);
       return null;
@@ -106,7 +108,6 @@ export class StrategistService {
     return { totalTrades: total, completedTrades: completed.length, bySource, equityChangePct };
   }
 
-  /** Analyse déterministe de repli (sans LLM) — multi-facteurs. */
   private deterministic(perf: any, trades: any[], regimes: any[], riskCfg: any): any {
     const total = trades.length || 1;
     const wins = trades.filter((t: any) => t.side === 'sell' && parseFloat(t.amount_out || '0') > parseFloat(t.amount_in || '0'));
@@ -115,18 +116,14 @@ export class StrategistService {
     for (const r of regimes) regimeCounts[r.regime] = (regimeCounts[r.regime] || 0) + 1;
     const dominant = Object.entries(regimeCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'range';
     let momentumFactor = 1; let mrFactor = 1; let gridFactor = 1; let arbFactor = 1;
-    // Equity trend
     if (perf.equityChangePct < -5) { momentumFactor *= 0.7; mrFactor *= 0.8; gridFactor *= 0.9; arbFactor *= 0.8; }
     else if (perf.equityChangePct < 0) { momentumFactor *= 0.85; mrFactor *= 0.9; }
     else if (perf.equityChangePct > 5) { momentumFactor *= 1.15; arbFactor *= 1.1; }
-    // Win rate
     if (winRate < 0.3) { momentumFactor *= 0.8; mrFactor *= 0.85; }
     else if (winRate > 0.6) { momentumFactor *= 1.1; mrFactor *= 1.1; }
-    // Régime
     if (dominant === 'bear') { momentumFactor *= 0.7; gridFactor *= 1.1; mrFactor *= 1.1; }
     else if (dominant === 'bull') { momentumFactor *= 1.15; mrFactor *= 0.9; }
     else if (dominant === 'high_vol') { gridFactor *= 1.15; arbFactor *= 1.1; momentumFactor *= 0.9; }
-    // Recovery mode
     if (riskCfg?.recovery_mode) { momentumFactor *= 0.7; mrFactor *= 0.8; gridFactor *= 0.8; arbFactor *= 0.8; }
     momentumFactor = this.clampFactor(momentumFactor);
     mrFactor = this.clampFactor(mrFactor);
@@ -135,10 +132,7 @@ export class StrategistService {
     return {
       source: 'deterministic',
       summary: `Equity 7j ${perf.equityChangePct.toFixed(2)}%, winRate ${(winRate*100).toFixed(0)}%, regime ${dominant} => mom=${momentumFactor} mr=${mrFactor} grid=${gridFactor} arb=${arbFactor}`,
-      momentumSizeFactor: momentumFactor,
-      meanReversionSizeFactor: mrFactor,
-      gridSizeFactor: gridFactor,
-      arbitrageSizeFactor: arbFactor,
+      momentumSizeFactor: momentumFactor, meanReversionSizeFactor: mrFactor, gridSizeFactor: gridFactor, arbitrageSizeFactor: arbFactor,
     };
   }
 
@@ -198,10 +192,14 @@ export class StrategistService {
         create: { key, value },
       }).catch(() => undefined);
     };
+    const grid = this.clampFactor(rec.gridSizeFactor ?? 1);
+    const arb = this.clampFactor(rec.arbitrageSizeFactor ?? 1);
     await upsert('strategist.momentumSizeFactor', String(momentum));
     await upsert('strategist.meanReversionSizeFactor', String(mr));
+    await upsert('strategist.gridSizeFactor', String(grid));
+    await upsert('strategist.arbitrageSizeFactor', String(arb));
     await upsert('strategist.updatedAt', new Date().toISOString());
-    return { momentumSizeFactor: momentum, meanReversionSizeFactor: mr };
+    return { momentumSizeFactor: momentum, meanReversionSizeFactor: mr, gridSizeFactor: grid, arbitrageSizeFactor: arb };
   }
 
   async getStatus(): Promise<any> {

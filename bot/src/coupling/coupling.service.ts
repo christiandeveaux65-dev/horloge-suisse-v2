@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { acquireCronRun } from '../common/cron-lock';
 import { PriceService } from '../price/price.service';
 import { sma, rsi, realizedVolatility, clamp } from '../indicators';
 import { CHAIN } from '../constants';
@@ -30,9 +31,10 @@ export class CouplingService {
   setEnabled(val: boolean): void { this.enabled = val; }
 
   /** Cron coupling : toutes les 30 minutes */
-  @Cron('0 */30 * * * *')
+  @Cron('0 */30 * * * *', { timeZone: 'Europe/Paris', name: 'coupling' })
   async handleCron(): Promise<void> {
     if (!this.enabled) return;
+    if (!(await acquireCronRun(this.prisma, 'coupling', 1800000))) return;
     try {
       await this.executeCycle();
     } catch (err: any) {
@@ -138,6 +140,30 @@ export class CouplingService {
             volatility: vol !== null ? Math.round(vol * 10000) / 10000 : null,
           },
         }),
+      },
+    });
+
+    // Modulation Momentum : OFF en capitulation, ×1.2 en surchauffe
+    const momMult = regime === 'capitulation' ? 0 : regime === 'surchauffe' ? 1.2 : 1;
+    await this.prisma.coupling_decision.create({
+      data: {
+        kind: 'momentum_modulation',
+        chain: CHAIN,
+        token: 'WETH',
+        detail: `Régime ${regime} (score ${score.toFixed(1)}) → Momentum ×${momMult}`,
+        payload: JSON.stringify({ score: Math.round(score * 10) / 10, regime, multiplier: momMult }),
+      },
+    });
+
+    // Modulation Mean Reversion : ×1.5 en capitulation, OFF en surchauffe
+    const mrMult = regime === 'surchauffe' ? 0 : regime === 'capitulation' ? 1.5 : 1;
+    await this.prisma.coupling_decision.create({
+      data: {
+        kind: 'mean_reversion_modulation',
+        chain: CHAIN,
+        token: 'WETH',
+        detail: `Régime ${regime} (score ${score.toFixed(1)}) → MR ×${mrMult}`,
+        payload: JSON.stringify({ score: Math.round(score * 10) / 10, regime, multiplier: mrMult }),
       },
     });
 
