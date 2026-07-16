@@ -19,9 +19,12 @@ import { FlashLoanModule } from '../flash-loan/flash-loan.module';
 import { BasisTradingModule } from '../basis-trading/basis-trading.module';
 import { StablecoinYieldModule } from '../stablecoin-yield/stablecoin-yield.module';
 import { BacktestModule } from '../backtest/backtest.module';
+import { OptimizeInjectModule } from '../optimize-inject/optimize-inject.module';
+import { PipelineModule } from '../pipeline/pipeline.module';
 
 @Module({
   imports: [
+    PipelineModule,
     TradeModule,
     DcaModule,
     MomentumModule,
@@ -41,6 +44,7 @@ import { BacktestModule } from '../backtest/backtest.module';
     BasisTradingModule,
     StablecoinYieldModule,
     BacktestModule,
+    OptimizeInjectModule,
   ],
   controllers: [ApiController],
 })

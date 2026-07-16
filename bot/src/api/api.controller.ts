@@ -26,6 +26,7 @@ import { PriceService } from '../price/price.service';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { TelegramService } from '../telegram/telegram.service';
+import { PipelineOrchestrator } from '../pipeline/pipeline.orchestrator';
 import { TOKENS, STABLECOINS } from '../constants';
 
 @ApiTags('Bot Trading — L\'Horloge Suisse v2')
@@ -57,6 +58,7 @@ export class ApiController {
     private readonly prisma: PrismaService,
     private readonly telegram: TelegramService,
     private readonly schedulerRegistry: SchedulerRegistry,
+    private readonly pipeline: PipelineOrchestrator,
   ) {}
 
   // ─── ADMIN — SECRETS RUNTIME ───
@@ -330,42 +332,71 @@ export class ApiController {
       basis_trading:    { schedule: '*/10 min',        role: 'Basis trading (MVP détection)',              trades: 'non (détecte+log, plomberie GMX/spot à venir)' },
       stablecoin_yield: { schedule: '*/30 min',        role: 'Rotation de rendement stablecoin (MVP)',     trades: 'non (compare+log, rotation non branchée)' },
       telegram_summary: { schedule: 'toutes les 6 h',  role: 'Résumé périodique Telegram',                 trades: 'non (notification)' },
+      supervision:      { schedule: '*/5 min',         role: 'Supervision proactive (auto-pause + alertes)', trades: 'non (surveillance + auto-pause)' },
     };
 
+    // Depuis la refonte : UN SEUL @Cron interne (« pipeline ») orchestre TOUS les modules
+    // séquentiellement toutes les 3 min. On lit son état réel dans le SchedulerRegistry.
     const jobs = this.schedulerRegistry.getCronJobs();
-    const crons: any[] = [];
+    let pipelineCron: any = { name: 'pipeline', running: false, schedule: '*/3 min', lastRun: null, nextRun: null };
     jobs.forEach((job: any, name: string) => {
+      if (name !== 'pipeline') return;
       let nextRun: string | null = null;
       let lastRun: string | null = null;
       try {
         const nd = job.nextDate?.();
-        // Luxon DateTime (cron v3+) → toISO(); sinon Date
         nextRun = nd ? (typeof nd.toISO === 'function' ? nd.toISO() : new Date(nd).toISOString()) : null;
       } catch { /* ignore */ }
       try {
         const ld = job.lastDate?.() ?? job.lastExecution;
         lastRun = ld ? new Date(ld).toISOString() : null;
       } catch { /* ignore */ }
-      const m = meta[name] ?? { schedule: '—', role: '—', trades: '—' };
-      crons.push({
-        name,
-        running: job.running ?? true,
-        schedule: m.schedule,
-        role: m.role,
-        trades: m.trades,
-        lastRun,
-        nextRun,
-      });
+      pipelineCron = { name: 'pipeline', running: job.running ?? true, schedule: '*/3 min', lastRun, nextRun };
     });
 
-    crons.sort((a, b) => a.name.localeCompare(b.name));
+    const status = this.pipeline.getStatus();
+    const freqs = status.nextModuleFrequencies as Record<string, string>;
+
+    // Détail par module : rôle + fréquence effective (gérée par le pipeline) + état activé.
+    const enabledMap: Record<string, boolean> = {
+      dca: this.dca.isEnabled(), momentum: this.momentum.isEnabled(),
+      mean_reversion: this.meanReversion.isEnabled(), risk: this.risk.isEnabled(),
+      coupling: this.coupling.isEnabled(), market: this.marketIntel.isEnabled(),
+      portfolio: this.portfolio.isEnabled(), portfolio_ledger: this.portfolio.isEnabled(),
+      grid: this.grid.isEnabled(), arbitrage: this.arbitrage.isEnabled(),
+      gmx: this.gmx.isEnabled(), gmx_monitor: this.gmx.isEnabled(),
+      aave: this.aave.isEnabled(), strategist: this.strategist.isEnabled(),
+      flash_loan: this.flashLoan.isEnabled(), basis_trading: this.basisTrading.isEnabled(),
+      stablecoin_yield: this.stablecoinYield.isEnabled(),
+    };
+
+    const modules = Object.keys(meta).map((name) => ({
+      name,
+      role: meta[name].role,
+      trades: meta[name].trades,
+      frequency: freqs[name] ?? meta[name].schedule,
+      enabled: enabledMap[name] ?? true,
+      lastCycleExecuted: status.modulesExecuted.includes(name),
+    })).sort((a, b) => a.name.localeCompare(b.name));
+
     return {
-      count: crons.length,
-      schedulerActive: crons.length > 0,
+      architecture: 'pipeline_sequentiel',
       note:
-        'Ces crons internes ne tournent que lorsque le conteneur est actif. Un cron externe (keepalive) ' +
+        'Depuis la refonte, un UNIQUE cron interne (« pipeline ») exécute tous les modules ' +
+        'SÉQUENTIELLEMENT toutes les 3 min (OBSERVER → ANALYSER → EXÉCUTER → MESURER → STRATÉGIE → ' +
+        'RAPPORT → OPTIMISER). La fréquence de chaque module est respectée via des buckets temporels. ' +
+        'Voir GET /api/pipeline/status pour le détail du dernier cycle. Un cron externe (keepalive) ' +
         'appelle POST /api/tick toutes les 5 min pour empêcher la mise en veille du conteneur.',
-      crons,
+      pipelineCron,
+      pipelineStatus: {
+        cycleCount: status.cycleCount,
+        lastCycleMs: status.lastCycleMs,
+        lastCycleAt: status.lastCycleAt,
+        currentPhase: status.currentPhase,
+        running: status.running,
+      },
+      moduleCount: modules.length,
+      modules,
       timestamp: new Date().toISOString(),
     };
   }

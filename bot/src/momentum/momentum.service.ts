@@ -221,14 +221,14 @@ export class MomentumService implements OnModuleInit {
     return 1;
   }
 
-  @Cron('0 */5 * * * *', { timeZone: 'Europe/Paris', name: 'momentum' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'momentum', 300000))) return;
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle momentum échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 

@@ -32,14 +32,14 @@ export class DcaService {
   setEnabled(val: boolean): void { this.enabled = val; }
 
   /** Cron DCA : toutes les 3 heures (~8 achats/jour) */
-  @Cron('0 0 */3 * * *', { timeZone: 'Europe/Paris', name: 'dca' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'dca', 10800000))) return;
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle DCA échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 

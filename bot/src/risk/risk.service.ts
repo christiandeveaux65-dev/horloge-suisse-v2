@@ -30,19 +30,17 @@ export class RiskService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  /** Cron Risk Manager : toutes les 5 minutes — CRITIQUE */
-  @Cron('0 */5 * * * *', { timeZone: 'Europe/Paris', name: 'risk' })
-  async handleCron(): Promise<void> {
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). CRITIQUE. */
+  async tick(): Promise<any> {
     if (!this.enabled) {
       this.logger.warn('⚠️ Risk Manager désactivé — DANGER');
-      return;
+      return { skipped: true, reason: 'disabled' };
     }
-    // Verrou distribué : une seule instance exécute le cycle risque par tick de 5 min.
-    if (!(await acquireCronRun(this.prisma, 'risk', 300000))) return;
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle Risk Manager échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 
@@ -657,6 +655,21 @@ export class RiskService {
   async isPaused(): Promise<boolean> {
     const cfg = await this.prisma.risk_config.findFirst();
     return cfg?.global_paused ?? false;
+  }
+
+  /**
+   * Pause globale FORCÉE par un superviseur externe (module de supervision proactive).
+   * Idempotent : ne réécrit pas la raison si une pause est déjà active. Journalise l'événement.
+   */
+  async forcePause(reason: string): Promise<{ paused: boolean; alreadyPaused: boolean }> {
+    const cfg = await this.getOrCreateConfig();
+    if (cfg.global_paused) return { paused: true, alreadyPaused: true };
+    await this.prisma.risk_config.update({
+      where: { id: cfg.id },
+      data: { global_paused: true, paused_reason: reason, paused_at: new Date() },
+    });
+    await this.logEvent('supervision_pause', reason);
+    return { paused: true, alreadyPaused: false };
   }
 
   /**

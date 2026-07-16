@@ -145,11 +145,15 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
     }
   }
 
-  // État spécifique DCA / Grid.
+  // État spécifique DCA / Grid / Momentum.
   let lastDcaBuy = 0;
   const gridState: { center: number; boughtLevels: Set<number>; lastLevel: number | null } = {
     center: 0, boughtLevels: new Set(), lastLevel: null,
   };
+  // Prix de référence par token pour le seuil d'achat DCA (buyThresholdPct).
+  const dcaRefPrice = new Map<string, number>();
+  // Sommet atteint par token pour le trailing stop Momentum (trailingStopPct).
+  const momPeak = new Map<string, number>();
 
   for (const t of timeline) {
     // Avancer les curseurs jusqu'à t.
@@ -165,7 +169,7 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
 
     switch (cfg.strategy) {
       case 'dca':
-        lastDcaBuy = stepDca(pf, cfg, cursors, t, prices, lastDcaBuy);
+        lastDcaBuy = stepDca(pf, cfg, cursors, t, prices, lastDcaBuy, dcaRefPrice);
         break;
       case 'grid':
         stepGrid(pf, cfg, cursors, t, gridState);
@@ -174,7 +178,7 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
         stepMeanReversion(pf, cfg, cursors, t);
         break;
       case 'momentum':
-        stepMomentum(pf, cfg, cursors, t);
+        stepMomentum(pf, cfg, cursors, t, momPeak);
         break;
     }
 
@@ -188,10 +192,16 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
 function stepDca(
   pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>,
   t: number, prices: Record<string, number>, lastBuy: number,
+  dcaRefPrice: Map<string, number>,
 ): number {
   const amountPerBuy = parseFloat(cfg.params.amountPerBuy ?? 50);
   const intervalHours = parseFloat(cfg.params.intervalHours ?? 24);
   const intervalMs = intervalHours * 3600 * 1000;
+  // Seuil d'achat optionnel : n'acheter que si le prix a baissé d'au moins |thr| %
+  // depuis le dernier achat du token. thr est négatif (ex : -5 => -5 %).
+  const thrRaw = cfg.params.buyThresholdPct;
+  const thr = thrRaw === undefined || thrRaw === null ? undefined : Number(thrRaw);
+  const useThr = thr !== undefined && Number.isFinite(thr) && thr < 0;
   // Panier : poids fournis, sinon équipondéré sur les tokens sélectionnés.
   const basket: { token: string; weight: number }[] =
     Array.isArray(cfg.params.basket) && cfg.params.basket.length
@@ -206,9 +216,16 @@ function stepDca(
   for (const leg of basket) {
     const cur = cursors.get(leg.token);
     if (!cur || cur.idx < 0 || cur.lastPrice <= 0) continue;
+    // Filtre de seuil : si le prix n'a pas assez baissé par rapport à la référence, on saute.
+    if (useThr) {
+      const ref = dcaRefPrice.get(leg.token);
+      if (ref !== undefined && cur.lastPrice > ref * (1 + (thr as number) / 100)) continue;
+    }
     const spend = amountPerBuy * leg.weight;
     if (pf.cash < spend) continue;
-    pf.buy(leg.token, spend, cur.lastPrice, t, 'dca');
+    if (pf.buy(leg.token, spend, cur.lastPrice, t, 'dca') && useThr) {
+      dcaRefPrice.set(leg.token, cur.lastPrice);
+    }
   }
   return t;
 }
@@ -310,11 +327,13 @@ function stepMeanReversion(
 // ─────────────────────── Momentum (EMA crossover) ──────────────────
 function stepMomentum(
   pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>, t: number,
+  momPeak: Map<string, number>,
 ) {
   const positionSizeUsd = parseFloat(
     cfg.params.positionSizeUsd ?? cfg.initialCapital / Math.max(1, cfg.tokens.length),
   );
   const stopLossPct = parseFloat(cfg.params.stopLossPct ?? 0); // 0 = désactivé
+  const trailingStopPct = parseFloat(cfg.params.trailingStopPct ?? 0); // 0 = désactivé
 
   for (const [token, cur] of cursors.entries()) {
     if (cur.idx < 1 || !cur.ema || cur.lastPrice <= 0) continue;
@@ -327,11 +346,23 @@ function stepMomentum(
     const p = pf['positions'].get(token);
     const hasPos = p && p.amountToken > 0;
 
+    // Trailing stop : suit le plus haut atteint depuis l'entrée ; sortie si repli de trailingStopPct %.
+    if (hasPos && trailingStopPct > 0) {
+      const peak = Math.max(momPeak.get(token) ?? price, price);
+      momPeak.set(token, peak);
+      if (peak > 0 && price <= peak * (1 - trailingStopPct / 100)) {
+        pf.sell(token, 'all', price, t, 'mom_trailing_stop');
+        momPeak.delete(token);
+        continue;
+      }
+    }
+
     // Stop-loss : sortie si le prix chute sous le coût moyen d'entrée.
     if (hasPos && stopLossPct > 0) {
       const avgCost = p!.costUsd / p!.amountToken;
       if (avgCost > 0 && price <= avgCost * (1 - stopLossPct / 100)) {
         pf.sell(token, 'all', price, t, 'mom_stop_loss');
+        momPeak.delete(token);
         continue;
       }
     }
@@ -341,9 +372,12 @@ function stepMomentum(
 
     if (crossUp && !hasPos) {
       const size = Math.min(positionSizeUsd, pf.cash);
-      if (size >= 5) pf.buy(token, size, price, t, 'mom_cross_up');
+      if (size >= 5 && pf.buy(token, size, price, t, 'mom_cross_up')) {
+        momPeak.set(token, price);
+      }
     } else if (crossDown && hasPos) {
       pf.sell(token, 'all', price, t, 'mom_cross_down');
+      momPeak.delete(token);
     }
   }
 }

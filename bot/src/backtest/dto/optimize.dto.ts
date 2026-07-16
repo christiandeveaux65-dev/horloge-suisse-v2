@@ -22,9 +22,20 @@ export class OptimizeDto {
   lossFunction?: string;
 
   @ApiPropertyOptional({
-    description: 'Nombre max de combinaisons à tester (défaut 200, max 1500). '
-      + 'Si l\'espace de recherche est plus petit, recherche exhaustive (grid) ; sinon random search.',
-    example: 200,
+    description: 'Méthode de recherche : grid (exhaustif), random (échantillonnage), '
+      + 'bayesian (TPE, converge plus vite). Si absent, choix automatique (grid si l\'espace est petit, sinon random).',
+    enum: ['grid', 'random', 'bayesian'],
+    example: 'bayesian',
+  })
+  @IsOptional()
+  @IsIn(['grid', 'random', 'bayesian'])
+  searchMethod?: 'grid' | 'random' | 'bayesian';
+
+  @ApiPropertyOptional({
+    description: 'Nombre max de combinaisons à tester (défaut 200, max 500000). '
+      + 'grid : recherche exhaustive si l\'espace tient dans le budget. '
+      + 'random / bayesian : nombre d\'évaluations. La recherche s\'arrête aussi après ~4 min (résultat partiel).',
+    example: 2000,
   })
   @IsOptional()
   @IsNumber()
@@ -41,7 +52,7 @@ export class OptimizeDto {
   tokens?: string[];
 
   @ApiPropertyOptional({
-    description: 'Timeframe (1h ou 4h, défaut 1h). Ignoré pour momentum qui optimise aussi le timeframe.',
+    description: 'Timeframe des bougies (1h ou 4h, défaut 1h).',
     example: '1h',
   })
   @IsOptional()
@@ -62,4 +73,13 @@ export class OptimizeDto {
   @IsOptional()
   @IsNumber()
   slippagePct?: number;
+
+  @ApiPropertyOptional({
+    description: 'Arrêt anticipé (bayesian/random) : stoppe si le meilleur score ne s\'améliore pas '
+      + 'pendant N itérations consécutives. 0 ou absent = désactivé.',
+    example: 200,
+  })
+  @IsOptional()
+  @IsNumber()
+  patience?: number;
 }

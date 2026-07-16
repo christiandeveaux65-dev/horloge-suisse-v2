@@ -63,11 +63,13 @@ export class BacktestController {
 
   @Post('optimize')
   @ApiOperation({
-    summary: 'Optimiser les paramètres d\'une stratégie (grid + random search, walk-forward anti-overfitting)',
+    summary: 'Optimiser les paramètres d\'une stratégie (grid / random / bayesian TPE, '
+      + 'parallélisé sur worker_threads, walk-forward anti-overfitting, courbe de convergence)',
   })
   async optimize(@Body() dto: OptimizeDto): Promise<any> {
     this.logger.log(
-      `optimize : strat=${dto.strategy} loss=${dto.lossFunction ?? 'Balanced'} maxIter=${dto.maxIterations ?? 200}`,
+      `optimize : strat=${dto.strategy} method=${dto.searchMethod ?? 'auto'} `
+      + `loss=${dto.lossFunction ?? 'Balanced'} maxIter=${dto.maxIterations ?? 200}`,
     );
     const result = await this.optimizer.optimize(dto);
     return { success: true, result };

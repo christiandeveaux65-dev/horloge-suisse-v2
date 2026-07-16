@@ -4,6 +4,8 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { PrismaModule } from './prisma/prisma.module';
 import { ApiModule } from './api/api.module';
 import { TelegramModule } from './telegram/telegram.module';
+import { PipelineModule } from './pipeline/pipeline.module';
+import { SupervisionModule } from './supervision/supervision.module';
 
 @Module({
   imports: [
@@ -12,6 +14,8 @@ import { TelegramModule } from './telegram/telegram.module';
     PrismaModule,
     TelegramModule,
     ApiModule,
+    PipelineModule,
+    SupervisionModule,
   ],
 })
 export class AppModule {}

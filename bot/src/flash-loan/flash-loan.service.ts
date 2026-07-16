@@ -39,12 +39,11 @@ export class FlashLoanService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(v: boolean): void { this.enabled = v; }
 
-  @Cron('0 */3 * * * *', { timeZone: 'Europe/Paris', name: 'flash_loan' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'flash_loan', 180000))) return;
-    try { await this.executeCycle(); }
-    catch (err: any) { this.logger.error(`Flash-loan cycle échoué: ${err.message}`); }
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
+    try { return await this.executeCycle(); }
+    catch (err: any) { this.logger.error(`Flash-loan cycle échoué: ${err.message}`); return { error: err.message }; }
   }
 
   async executeCycle(): Promise<any> {

@@ -31,14 +31,14 @@ export class CouplingService {
   setEnabled(val: boolean): void { this.enabled = val; }
 
   /** Cron coupling : toutes les 30 minutes */
-  @Cron('0 */30 * * * *', { timeZone: 'Europe/Paris', name: 'coupling' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'coupling', 1800000))) return;
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle coupling échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 

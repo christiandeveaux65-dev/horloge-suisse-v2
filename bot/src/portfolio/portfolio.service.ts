@@ -25,29 +25,25 @@ export class PortfolioService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  /** Cron snapshot : toutes les 15 minutes (permet au circuit breaker Risk de détecter les drawdowns rapides) */
-  @Cron('0 */15 * * * *', { timeZone: 'Europe/Paris', name: 'portfolio' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'portfolio', 900000))) return;
+  /** Snapshot portefeuille (15 min) — appelé séquentiellement par le PipelineOrchestrator. */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.takeSnapshot();
+      return await this.takeSnapshot();
     } catch (err: any) {
       this.logger.error(`Snapshot portefeuille échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 
-  /** Cron dédié détection wallet ledger : toutes les 30 minutes.
-   *  Récupère les balances on-chain, compare au dernier snapshot connu, journalise
-   *  tout écart non expliqué par les trades du bot dans wallet_ledger. */
-  @Cron('0 */30 * * * *', { timeZone: 'Europe/Paris', name: 'portfolio_ledger' })
-  async handleLedgerCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'portfolio_ledger', 1800000))) return;
+  /** Détection wallet ledger (30 min) — appelé séquentiellement par le PipelineOrchestrator. */
+  async tickLedger(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.detectWalletMovements();
+      return await this.detectWalletMovements();
     } catch (err: any) {
       this.logger.error(`Détection wallet ledger échouée: ${err.message}`);
+      return { error: err.message };
     }
   }
 

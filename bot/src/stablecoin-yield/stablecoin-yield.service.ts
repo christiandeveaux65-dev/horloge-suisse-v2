@@ -63,12 +63,11 @@ export class StablecoinYieldService implements OnModuleInit {
       .catch((err: any) => this.logger.error(`Persistance état Stablecoin-Yield échouée: ${err.message}`));
   }
 
-  @Cron('0 */30 * * * *', { timeZone: 'Europe/Paris', name: 'stablecoin_yield' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'stablecoin_yield', 1800000))) return;
-    try { await this.executeCycle(); }
-    catch (err: any) { this.logger.error(`Stablecoin yield cycle échoué: ${err.message}`); }
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
+    try { return await this.executeCycle(); }
+    catch (err: any) { this.logger.error(`Stablecoin yield cycle échoué: ${err.message}`); return { error: err.message }; }
   }
 
   async executeCycle(): Promise<any> {

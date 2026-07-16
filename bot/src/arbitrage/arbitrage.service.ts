@@ -73,14 +73,14 @@ export class ArbitrageService implements OnModuleInit {
     }
   }
 
-  @Cron('0 */5 * * * *', { timeZone: 'Europe/Paris', name: 'arbitrage' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'arbitrage', 300000))) return;
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle arbitrage échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 

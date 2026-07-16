@@ -65,14 +65,14 @@ export class AaveService implements OnModuleInit {
       .catch((err: any) => this.logger.error(`Persistance état Aave échouée: ${err.message}`));
   }
 
-  @Cron('0 */15 * * * *', { timeZone: 'Europe/Paris', name: 'aave' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'aave', 900000))) return;
+  /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle Aave échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 

@@ -38,37 +38,36 @@ export class GmxService {
   isEnabled(): boolean { return this.enabled; }
   setEnabled(val: boolean): void { this.enabled = val; }
 
-  // Phase 3 : réévaluation (adoption + ouverture) toutes les 4h.
-  @Cron('0 0 */4 * * *', { timeZone: 'Europe/Paris', name: 'gmx' })
-  async handleCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'gmx', 14400000))) return;
+  // Phase 3 : réévaluation (adoption + ouverture) toutes les 4h. Appelé par le PipelineOrchestrator.
+  async tick(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
-      await this.executeCycle();
+      return await this.executeCycle();
     } catch (err: any) {
       this.logger.error(`Cycle GMX échoué: ${err.message}`);
+      return { error: err.message };
     }
   }
 
   // Surveillance RAPPROCHÉE des positions ouvertes (stop-loss / take-profit / trailing)
   // toutes les 5 minutes : une position à effet de levier ne peut pas attendre 4h.
-  // Ne fait QUE surveiller/protéger les positions existantes (n'ouvre rien).
-  @Cron('0 */5 * * * *', { timeZone: 'Europe/Paris', name: 'gmx_monitor' })
-  async handleMonitorCron(): Promise<void> {
-    if (!this.enabled) return;
-    if (!(await acquireCronRun(this.prisma, 'gmx_monitor', 300000))) return;
+  // Ne fait QUE surveiller/protéger les positions existantes (n'ouvre rien). Appelé par le PipelineOrchestrator.
+  async tickMonitor(): Promise<any> {
+    if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
       // N'agit que s'il existe au moins une position ouverte (évite tout coût inutile).
       const openCount = await this.prisma.gmx_position.count({ where: { status: 'open' } });
-      if (openCount === 0) return;
+      if (openCount === 0) return { skipped: true, reason: 'no_open_positions' };
       const cfg = await this.ensureConfig();
       const monitoring = await this.monitorPositions(cfg);
       const actions = monitoring.filter((m: any) => m.action && m.action !== 'hold' && m.action !== 'skip');
       if (actions.length > 0) {
         this.logger.log(`👁️ GMX monitor : ${actions.length} action(s) sur position — ${JSON.stringify(actions)}`);
       }
+      return { openCount, actions };
     } catch (err: any) {
       this.logger.error(`Surveillance GMX échouée: ${err.message}`);
+      return { error: err.message };
     }
   }
 

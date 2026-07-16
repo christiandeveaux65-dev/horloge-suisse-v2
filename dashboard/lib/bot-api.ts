@@ -1,5 +1,5 @@
-const BASE = process.env.BOT_API_URL ?? ''
-const KEY = process.env.BOT_API_KEY ?? ''
+const BASE = process.env.BOT_API_URL ?? process.env.NEXT_PUBLIC_BOT_API_URL ?? ''
+const KEY = process.env.BOT_API_KEY ?? process.env.NEXT_PUBLIC_BOT_API_KEY ?? ''
 
 export interface BotResponse<T = unknown> {
   ok: boolean

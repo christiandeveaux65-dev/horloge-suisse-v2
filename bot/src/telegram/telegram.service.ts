@@ -250,6 +250,16 @@ export class TelegramService {
    * (circuit breaker, pause drawdown > 5 %, stop-loss portefeuille).
    * Tout le reste (recovery_mode, trailing armed, scans…) est ignoré.
    */
+  /** Notification de supervision proactive. immediate=true → envoi direct (alerte critique, sans file d'attente). */
+  async notifySupervision(text: string, immediate = false): Promise<void> {
+    if (!this.enabled) return;
+    if (immediate) {
+      await this.sendMessage(text);
+    } else {
+      this.enqueue(text);
+    }
+  }
+
   notifyRisk(kind: string, detail: string): void {
     if (!this.enabled) return;
     if (!this.criticalRiskKinds.has(kind)) return;
@@ -270,10 +280,14 @@ export class TelegramService {
     this.enqueue(lines.join('\n'));
   }
 
-  // ═══ Résumé périodique (toutes les 6 h) ═══
-  @Cron('0 0 */6 * * *', { timeZone: 'Europe/Paris', name: 'telegram_summary' })
-  async handleSummaryCron(): Promise<void> {
-    await this.sendSummary();
+  // ═══ Résumé périodique (toutes les 6 h) — appelé séquentiellement par le PipelineOrchestrator ═══
+  async tickSummary(): Promise<any> {
+    try {
+      return await this.sendSummary();
+    } catch (err: any) {
+      this.logger.error(`Résumé Telegram échoué: ${err.message}`);
+      return { error: err.message };
+    }
   }
 
   /**

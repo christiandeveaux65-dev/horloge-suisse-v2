@@ -40,6 +40,8 @@ model strategy {
   slippage_bps    Int      @default(50)
   max_per_trade   String   @default("200")
   smart_dca       Boolean  @default(false)
+  interval_hours  Int      @default(24)
+  buy_threshold_pct Int    @default(0)
   active          Boolean  @default(true)
   paused          Boolean  @default(false)
   created_at      DateTime @default(now())
@@ -101,6 +103,7 @@ model momentum_config {
   rsi_period         Int        @default(14)
   rsi_oversold       Int        @default(35)
   rsi_overbought     Int        @default(70)
+  trailing_stop_pct  Int        @default(3)
   active             Boolean    @default(true)
   paused             Boolean    @default(false)
   created_at         DateTime   @default(now())
@@ -279,6 +282,8 @@ model backtest_optimization {
   out_sample_period String   @default("{}") // {start,end}
   status            String   @default("completed")
   notes             String   @default("")
+  exec_ms           Int      @default(0)   // temps d'exécution total (ms)
+  convergence       String   @default("[]") // JSON [{iter, bestScore}] courbe de convergence
   created_at        DateTime @default(now())
 
   @@index([strategy_type, created_at])
@@ -369,6 +374,7 @@ model grid_config {
   token_quote String       @default("WETH")
   budget_usd  String       @default("1000")
   grid_levels Int          @default(10)
+  range_pct   Int          @default(10)
   price_lower String       @default("0")
   price_upper String       @default("0")
   auto_range  Boolean      @default(true)
@@ -410,6 +416,7 @@ model mean_reversion_config {
   stop_loss_pct     Int                       @default(4)
   take_profit_pct   Int                       @default(5)
   max_per_trade_pct Int                       @default(25)
+  trade_size_usd    String                    @default("100")
   active            Boolean                   @default(true)
   paused            Boolean                   @default(false)
   created_at        DateTime                  @default(now())
@@ -620,4 +627,46 @@ model User {
   role       String   @default("user")
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
+}
+
+model optimize_injection {
+  id              String   @id @default(uuid())
+  strategy        String
+  optimization_id String   @default("")
+  old_params      String   @default("{}")
+  new_params      String   @default("{}")
+  wfe             String   @default("0")
+  action          String   @default("apply") // "apply" | "rollback" | "auto"
+  active          Boolean  @default(true)
+  note            String   @default("")
+  created_at      DateTime @default(now())
+
+  @@index([strategy, created_at])
+  @@index([strategy, active])
+}
+
+// ─── Supervision proactive ───
+model supervision_config {
+  id                        String   @id @default(uuid())
+  drawdown_warn_pct         Float    @default(3)
+  drawdown_max_pct          Float    @default(5)
+  max_consecutive_failures  Int      @default(5)
+  kucoin_latency_max_ms     Int      @default(10000)
+  module_error_rate_max     Float    @default(0.5)
+  auto_pause_enabled        Boolean  @default(true)
+  last_daily_health_date    String   @default("")
+  updated_at                DateTime @updatedAt
+  created_at                DateTime @default(now())
+}
+
+model supervision_alert {
+  id         String   @id @default(uuid())
+  level      String   @default("info") // "info" | "warning" | "critical"
+  category   String   // "auto_pause" | "drawdown" | "trade_failure" | "daily_health" | "latency" | "module_errors"
+  message    String
+  payload    String   @default("{}")
+  created_at DateTime @default(now())
+
+  @@index([created_at])
+  @@index([category, created_at])
 }
