@@ -236,10 +236,20 @@ export const AAVE_HF_DECIMALS = 18;
 // rentabilité refusait quasiment TOUS les achats → grille morte (1 trade / 50).
 // Phase 3 : 5 niveaux sur une fourchette ±4 % (largeur 8 %) → pas ~1.6 %, au-dessus
 // du breakeven grille recalibré (marge plafonnée à 0.4 % → breakeven ~1.5 %).
-// GRID_BUDGET_USD = plafond de sécurité du capital grid. Relevé 1000 → 4000 pour que
-// la directive du Strategy Evaluator (allocation ~46 % ≈ $3600) gouverne réellement le
-// capital grid : sinon Math.min(cfg.budget_usd, GRID_BUDGET_USD) neutralisait la directive.
-export const GRID_BUDGET_USD = 4000;
+// GRID_BUDGET_USD = PLAFOND DE SÉCURITÉ ABSOLU du capital grid (ceinture de sécurité).
+// Le budget réel est désormais gouverné STRICTEMENT par la directive du Strategy
+// Evaluator (allocation % × capital), et non plus par l'optimiseur (qui réinjectait
+// budget_usd=5000 à chaque cycle → hémorragie de $552 en 6h). Ce plafond ne sert que de
+// garde-fou ultime au cas où la directive donnerait une allocation anormalement élevée.
+export const GRID_BUDGET_USD = 2000;
+// ─── FIX URGENT hémorragie USDC (juillet 2026) ───
+// Symptôme : 42 achats / 6 ventes en 6h → WETH accumulé sans revente, USDC brûlé.
+// Garde-fous anti-accumulation :
+export const GRID_MAX_OPEN_POSITIONS = 5;   // max positions buy non soldées simultanées
+export const GRID_BUY_COOLDOWN_MIN = 20;    // délai minimum (min) entre deux achats
+export const GRID_SELL_TARGET_PCT = 0.5;    // cible de vente par position : +0.5 % au-dessus du prix d'achat
+export const GRID_MIN_BUY_GAP_PCT = 1.0;    // n'ajoute une position que si le prix a baissé ≥1 % sous la position ouverte la moins chère
+export const GRID_MAX_SELLS_PER_CYCLE = 5;  // nb max de ventes soldées par cycle (sécurité)
 export const GRID_LEVELS = 5;
 export const GRID_PER_LEVEL_USD = 100;
 // Fourchette par défaut (demi-largeur en %) si range_pct non renseigné en config.

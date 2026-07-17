@@ -17,7 +17,9 @@ const PARAM_MAPPING: Record<StrategyName, Record<string, { col: string; type: 'i
   grid: {
     rangePct:  { col: 'range_pct',   type: 'int' },
     levels:    { col: 'grid_levels', type: 'int' },
-    budgetUsd: { col: 'budget_usd',  type: 'str' },
+    // budgetUsd VOLONTAIREMENT retiré : le budget du grid est gouverné STRICTEMENT par
+    // la directive du Strategy Evaluator (applyEvaluatorDirectives). L'optimiseur ne doit
+    // plus réinjecter budget_usd (il écrasait la directive avec 5000 → hémorragie USDC).
   },
   mean_reversion: {
     rsiPeriod:     { col: 'rsi_period',     type: 'int' },
