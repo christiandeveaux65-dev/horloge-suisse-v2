@@ -44,26 +44,26 @@ describe('Calcul de drawdown (borné 0-100)', () => {
 });
 
 describe('Limites hardcodées Mean Reversion', () => {
-  it('MAX_TRADE_SIZE_MR = 75', () => {
-    expect(MAX_TRADE_SIZE_MR).toBe(75);
+  it('MAX_TRADE_SIZE_MR = 100', () => {
+    expect(MAX_TRADE_SIZE_MR).toBe(100);
   });
 
-  it('MAX_EXPOSURE_PER_TOKEN = 300', () => {
-    expect(MAX_EXPOSURE_PER_TOKEN).toBe(300);
+  it('MAX_EXPOSURE_PER_TOKEN = 400', () => {
+    expect(MAX_EXPOSURE_PER_TOKEN).toBe(400);
   });
 
-  it('MAX_TOTAL_EXPOSURE_MR = 600', () => {
-    expect(MAX_TOTAL_EXPOSURE_MR).toBe(600);
+  it('MAX_TOTAL_EXPOSURE_MR = 800', () => {
+    expect(MAX_TOTAL_EXPOSURE_MR).toBe(800);
   });
 
   it('position sizing ne dépasse jamais MAX_TRADE_SIZE_MR', () => {
     const requestedSize = 150;
     const actualSize = Math.min(requestedSize, MAX_TRADE_SIZE_MR);
-    expect(actualSize).toBe(75);
+    expect(actualSize).toBe(100);
   });
 
   it('position sizing respecte MAX_EXPOSURE_PER_TOKEN', () => {
-    const currentExposure = 250;
+    const currentExposure = 350;
     const requestedSize = 100;
     const maxAllowed = MAX_EXPOSURE_PER_TOKEN - currentExposure;
     const actualSize = Math.min(requestedSize, maxAllowed, MAX_TRADE_SIZE_MR);
@@ -71,15 +71,15 @@ describe('Limites hardcodées Mean Reversion', () => {
   });
 
   it('position sizing respecte MAX_TOTAL_EXPOSURE_MR', () => {
-    const totalExposure = 550;
+    const totalExposure = 770;
     const requestedSize = 75;
     const maxAllowed = MAX_TOTAL_EXPOSURE_MR - totalExposure;
     const actualSize = Math.min(requestedSize, maxAllowed, MAX_TRADE_SIZE_MR);
-    expect(actualSize).toBe(50);
+    expect(actualSize).toBe(30);
   });
 
   it('rejette un trade si exposition totale dépassée', () => {
-    const totalExposure = 600;
+    const totalExposure = 850;
     const allowed = totalExposure < MAX_TOTAL_EXPOSURE_MR;
     expect(allowed).toBe(false);
   });

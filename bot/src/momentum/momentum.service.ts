@@ -8,8 +8,10 @@ import { BlockchainService } from '../blockchain/blockchain.service';
 import { computeSignal, IndicatorSnapshot } from '../indicators';
 import {
   CHAIN, MOMENTUM_ALTS_SIZE_USD, MOMENTUM_BC_SIZE_USD,
-  TARGET_VOLATILITY,
+  TARGET_VOLATILITY, MOMENTUM_MIN_HOLD_MIN,
 } from '../constants';
+import { getStrategyModulation } from '../common/strategy-modulation';
+import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
 
 /**
  * Momentum — Stratégie tactique SMA + RSI
@@ -297,7 +299,7 @@ export class MomentumService implements OnModuleInit {
           results.push({ token, action: 'skip', reason: 'coupling_capitulation' });
           continue;
         }
-        const result = await this.tryOpenPosition(cfg, token, snap, riskCfg, couplingMult);
+        const result = await this.tryOpenPosition(cfg, token, snap, riskCfg, couplingMult, prices);
         results.push(result);
       }
     }
@@ -319,16 +321,32 @@ export class MomentumService implements OnModuleInit {
       });
     }
 
-    // Stop-loss / Trailing stop
+    // Durée de détention (minutes) depuis l'ouverture.
+    const holdMin = pos.opened_at
+      ? (Date.now() - new Date(pos.opened_at).getTime()) / 60000
+      : Infinity;
+    const withinMinHold = holdMin < MOMENTUM_MIN_HOLD_MIN;
+
+    // Stop-loss HARD (depuis le prix d'entrée) : TOUJOURS actif, même pendant la
+    // détention minimum — c'est la seule sortie autorisée avant le seuil.
     const stopLossPct = cfg.stop_loss_pct;
     const basicStop = entry * (1 - stopLossPct / 100);
-    const trailingStop = highest * (1 - stopLossPct / 100);
-    const stopPrice = Math.max(basicStop, trailingStop);
+    if (price <= basicStop) {
+      return this.closePosition(cfg, pos, price, 'stop_loss');
+    }
 
-    if (price <= stopPrice) {
-      const isTrailing = stopPrice > basicStop + 0.0001;
-      const reason = isTrailing ? 'trailing_stop' : 'stop_loss';
-      return this.closePosition(cfg, pos, price, reason);
+    // Pendant la détention minimum : aucune autre sortie (ni trailing, ni signal
+    // inverse, ni take-profit). Empêche les round-trips perdants en 3-9 min.
+    if (withinMinHold) {
+      return null;
+    }
+
+    // Trailing stop (au-delà de la détention minimum) — utilise trailing_stop_pct
+    // (param optimisé) s'il est défini, sinon retombe sur stop_loss_pct.
+    const trailingPct = cfg.trailing_stop_pct > 0 ? cfg.trailing_stop_pct : stopLossPct;
+    const trailingStop = highest * (1 - trailingPct / 100);
+    if (price <= trailingStop) {
+      return this.closePosition(cfg, pos, price, 'trailing_stop');
     }
 
     // Signal de vente
@@ -480,6 +498,7 @@ export class MomentumService implements OnModuleInit {
 
   private async tryOpenPosition(
     cfg: any, token: string, snap: IndicatorSnapshot, riskCfg: any, couplingMult: number = 1,
+    prices: number[] = [],
   ): Promise<any> {
     // Compter les positions ouvertes
     const openCount = await this.prisma.position.count({
@@ -495,6 +514,12 @@ export class MomentumService implements OnModuleInit {
     });
     if (existing) {
       return { token, action: 'skip', reason: 'position_deja_ouverte' };
+    }
+
+    // Pilotage adaptatif (Strategist × Strategy Evaluator).
+    const modulation = await getStrategyModulation(this.prisma, 'momentum');
+    if (!modulation.active) {
+      return { token, action: 'skip', reason: 'directive_inactive', modulation: modulation.reason };
     }
 
     // Calculer la taille
@@ -524,6 +549,11 @@ export class MomentumService implements OnModuleInit {
       sizeUsd = sizeUsd * couplingMult;
     }
 
+    // Pilotage adaptatif : facteur de taille Strategist × allocation Evaluator
+    if (modulation.sizeFactor !== 1) {
+      sizeUsd = sizeUsd * modulation.sizeFactor;
+    }
+
     // Plafonnement par budget restant
     if (remaining <= 1) {
       return { token, action: 'skip', reason: 'budget_epuisé' };
@@ -533,6 +563,32 @@ export class MomentumService implements OnModuleInit {
     sizeUsd = Math.floor(sizeUsd * 100) / 100;
     if (sizeUsd < 5) {
       return { token, action: 'skip', reason: 'taille_trop_faible', sizeUsd };
+    }
+
+    // Filtre de rentabilité minimum : ne trader que si l'amplitude de mouvement
+    // attendue dépasse le coût de l'aller-retour DEX (frais + slippage + gas) + marge.
+    // Proxy du mouvement attendu pour le momentum = amplitude du range récent
+    // (max - min) / moyenne sur la fenêtre longue.
+    const window = (prices || []).slice(-Math.max(2, cfg.ma_long || 20));
+    if (window.length >= 2) {
+      const mx = Math.max(...window);
+      const mn = Math.min(...window);
+      const mean = window.reduce((a, b) => a + b, 0) / window.length;
+      const expectedMovePct = mean > 0 ? ((mx - mn) / mean) * 100 : 0;
+      const minPP = await getMinProfitPct(this.prisma, 'momentum');
+      const est = estimateRoundTripCost(sizeUsd, minPP);
+      if (!passesProfitability(expectedMovePct, est)) {
+        this.logger.log(
+          `[RENTABILITÉ] Momentum ${token} REFUSÉ : mouvement attendu ${expectedMovePct.toFixed(2)}% < seuil ${est.breakevenPct.toFixed(2)}% (coût ${est.costPct.toFixed(2)}% + marge ${minPP.toFixed(2)}%)`,
+        );
+        return {
+          token,
+          action: 'skip',
+          reason: 'rentabilite_insuffisante',
+          expectedMovePct: Number(expectedMovePct.toFixed(2)),
+          breakevenPct: Number(est.breakevenPct.toFixed(2)),
+        };
+      }
     }
 
     // Exécuter l'achat
@@ -577,11 +633,23 @@ export class MomentumService implements OnModuleInit {
     const configs = await this.prisma.momentum_config.findMany({
       include: { positions: { where: { status: 'open' } } },
     });
+    const minPP = await getMinProfitPct(this.prisma, 'momentum');
+    const estRef = estimateRoundTripCost(MOMENTUM_ALTS_SIZE_USD, minPP);
     return {
       enabled: this.enabled,
+      min_holding_minutes: MOMENTUM_MIN_HOLD_MIN,
+      profitability: {
+        min_profit_pct: minPP,
+        round_trip_cost_pct_estimate: Number(estRef.costPct.toFixed(3)),
+        breakeven_move_pct_estimate: Number(estRef.breakevenPct.toFixed(3)),
+        note: 'Un momentum n\'entre que si l\'amplitude de range attendue dépasse le seuil de breakeven. Ajustable via app_config: profitability.momentum.minProfitPct ou profitability.minProfitPct.',
+      },
       configs: configs.map((c: any) => ({
         ...c,
         openPositions: c.positions?.length ?? 0,
+        // Durée de détention minimum : sous ce seuil, seul le stop-loss hard
+        // peut clôturer une position (pas de sortie sur signal inverse / trailing).
+        min_holding_minutes: MOMENTUM_MIN_HOLD_MIN,
       })),
     };
   }

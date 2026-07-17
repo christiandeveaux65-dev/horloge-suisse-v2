@@ -277,30 +277,32 @@ export class PortfolioService {
 
   /** Calculer le PnL pour un token */
   private async calculatePnL(token: string): Promise<any> {
-    // Total acheté
+    // Total acheté (amount_in = USD dépensé, amount_out = quantité de token reçue)
     const buys = await this.prisma.trade.findMany({
       where: {
         target_token: token,
         side: 'buy',
         status: { in: ['completed', 'simulated'] },
       },
-      select: { amount_in: true, amount_out: true },
+      select: { amount_in: true, amount_out: true, executed_at: true },
+      orderBy: { executed_at: 'asc' },
     });
 
-    // Total vendu
+    // Total vendu (amount_in = quantité de token vendue, amount_out = USD reçu)
     const sells = await this.prisma.trade.findMany({
       where: {
         source_token: token,
         side: 'sell',
         status: { in: ['completed', 'simulated'] },
       },
-      select: { amount_in: true, amount_out: true },
+      select: { amount_in: true, amount_out: true, executed_at: true },
+      orderBy: { executed_at: 'asc' },
     });
 
     const totalBoughtUsd = buys.reduce((s, t) => s + parseFloat(t.amount_in), 0);
     const totalSoldUsd = sells.reduce((s, t) => s + parseFloat(t.amount_out), 0);
 
-    // Valeur actuelle du solde
+    // Valeur actuelle du solde restant en portefeuille
     let currentValue = 0;
     try {
       const { formatted } = await this.blockchain.getBalance(token);
@@ -308,9 +310,43 @@ export class PortfolioService {
       currentValue = parseFloat(formatted) * price;
     } catch {}
 
-    const realizedPnl = totalSoldUsd - totalBoughtUsd;
-    const unrealizedPnl = currentValue; // valeur actuelle restante
-    const totalPnl = realizedPnl + unrealizedPnl - (totalBoughtUsd - totalSoldUsd);
+    // ── PnL réalisé : apparier FIFO les ventes contre le COÛT des quantités
+    //    effectivement vendues (et non le coût total acheté). ──
+    const lots: Array<{ qty: number; costUsd: number }> = [];
+    for (const b of buys) {
+      const qty = parseFloat(b.amount_out) || 0; // token reçu
+      const costUsd = parseFloat(b.amount_in) || 0; // USD dépensé
+      if (qty > 0 && costUsd > 0) lots.push({ qty, costUsd });
+    }
+
+    let realizedPnl = 0;
+    for (const s of sells) {
+      let qtyToSell = parseFloat(s.amount_in) || 0; // token vendu
+      const proceedsUsd = parseFloat(s.amount_out) || 0; // USD reçu
+      if (qtyToSell <= 0) continue;
+      const soldQtyTotal = qtyToSell;
+      let matchedCost = 0;
+      let matchedQty = 0;
+      while (qtyToSell > 1e-12 && lots.length > 0) {
+        const lot = lots[0];
+        const take = Math.min(lot.qty, qtyToSell);
+        const costPart = lot.costUsd * (take / lot.qty);
+        matchedCost += costPart;
+        matchedQty += take;
+        lot.qty -= take;
+        lot.costUsd -= costPart;
+        qtyToSell -= take;
+        if (lot.qty <= 1e-12) lots.shift();
+      }
+      if (matchedQty > 0) {
+        // Produit proportionnel aux quantités réellement appariées à un coût connu.
+        const proceedsForMatched = proceedsUsd * (matchedQty / soldQtyTotal);
+        realizedPnl += proceedsForMatched - matchedCost;
+      }
+    }
+
+    // PnL total = produit des ventes + valeur actuelle du solde − coût total acheté.
+    const totalPnl = totalSoldUsd + currentValue - totalBoughtUsd;
 
     return {
       totalBoughtUsd,

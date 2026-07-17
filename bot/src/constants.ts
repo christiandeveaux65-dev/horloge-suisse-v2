@@ -105,6 +105,10 @@ export const DCA_BASKET: { token: string; weight: number }[] = [
 export const MOMENTUM_ALTS_SIZE_USD = 150;  // $150/trade pour alts
 export const MOMENTUM_BC_SIZE_USD = 200;    // $200/trade pour blue chips
 export const TARGET_VOLATILITY = 0.02;      // volatilité cible pour sizing
+// Durée de détention minimum d'une position momentum (minutes). Sous ce seuil,
+// aucune sortie sur signal inverse ou trailing stop — seul le stop-loss hard reste
+// actif. Empêche les round-trips perdants en quelques minutes.
+export const MOMENTUM_MIN_HOLD_MIN = 30;
 
 // ─── Split orders ───
 export const SPLIT_ORDER_THRESHOLD_USD = 500;

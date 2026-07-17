@@ -46,7 +46,9 @@ export class RiskService {
 
   /** Exécuter toutes les vérifications de protection */
   async executeCycle(): Promise<any> {
-    await this.ensurePhase3Config();
+    // NB : les défauts Phase 3 sont désormais appliqués à la création de la config
+    // (getOrCreateConfig) et non plus forcés à chaque cycle — cela évite d'écraser
+    // toute valeur ajustée manuellement en DB.
     const athCheck = await this.updateATHAndCheck();
     const cb = await this.checkCircuitBreaker();
     const recovery = await this.updateRecoveryMode();
@@ -56,17 +58,6 @@ export class RiskService {
 
     const paused = await this.isPaused();
     return { paused, ath_check: athCheck, circuit_breaker: cb, recovery, trailing_stop: trailing, stop_loss: stopLoss, stops_checked: stopsChecked };
-  }
-
-  /** Aligne la config sur les seuils Phase 3 (idémpotent, s'exécute chaque cycle). */
-  private async ensurePhase3Config(): Promise<void> {
-    const cfg = await this.getOrCreateConfig();
-    const updates: any = {};
-    if (cfg.circuit_breaker_threshold_pct !== 7) updates.circuit_breaker_threshold_pct = 7;
-    if (cfg.circuit_breaker_window_hours !== 24) updates.circuit_breaker_window_hours = 24;
-    if (Object.keys(updates).length > 0) {
-      await this.prisma.risk_config.update({ where: { id: cfg.id }, data: updates });
-    }
   }
 
   /** Calculer la valeur totale du portefeuille en USD */
@@ -732,7 +723,15 @@ export class RiskService {
   private async getOrCreateConfig(): Promise<any> {
     let cfg = await this.prisma.risk_config.findFirst();
     if (!cfg) {
-      cfg = await this.prisma.risk_config.create({ data: {} });
+      // Défauts Phase 3 appliqués UNIQUEMENT à la création initiale. Une fois la
+      // config créée, ses valeurs (y compris les réglages manuels) sont respectées
+      // et jamais réécrites automatiquement.
+      cfg = await this.prisma.risk_config.create({
+        data: {
+          circuit_breaker_threshold_pct: 7,
+          circuit_breaker_window_hours: 24,
+        },
+      });
     }
     return cfg;
   }

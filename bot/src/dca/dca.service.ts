@@ -7,6 +7,8 @@ import { PriceService } from '../price/price.service';
 import {
   DCA_BASE_AMOUNT_USD, DCA_MAX_PER_TRADE_USD, DCA_MIN_LEG_USD, DCA_BASKET, CHAIN,
 } from '../constants';
+import { getStrategyModulation } from '../common/strategy-modulation';
+import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
 
 /**
  * DCA Smart — Achats récurrents diversifiés avec USDC.
@@ -85,8 +87,57 @@ export class DcaService {
       this.logger.log(`DCA : stratégie normalisée (achat ~$${DCA_BASE_AMOUNT_USD}, plafond $${DCA_MAX_PER_TRADE_USD}, fréquence 3h)`);
     }
 
-    // Calculer le montant de base
-    let buyAmount = DCA_BASE_AMOUNT_USD; // ~$7
+    // ─── Pilotage adaptatif (Strategy Evaluator) ───
+    const modulation = await getStrategyModulation(this.prisma, 'dca');
+    if (!modulation.active) {
+      this.logger.warn(`DCA skipé : directive inactive (${modulation.reason})`);
+      return { success: false, reason: 'directive_inactive', modulation: modulation.reason };
+    }
+
+    // ─── Paramètre optimisé : interval_hours (espacement minimum entre achats) ───
+    // Le pipeline appelle DCA toutes les 3 h ; si l'optimisation demande un intervalle
+    // plus long, on saute tant que le dernier achat est trop récent.
+    const intervalHours = strategy.interval_hours || 0;
+    if (intervalHours > 3) {
+      const lastBuy = await this.prisma.trade.findFirst({
+        where: { source: 'dca', status: { in: ['completed', 'simulated'] } },
+        orderBy: { executed_at: 'desc' },
+        select: { executed_at: true },
+      });
+      if (lastBuy?.executed_at) {
+        const elapsedH = (Date.now() - new Date(lastBuy.executed_at).getTime()) / 3600000;
+        if (elapsedH < intervalHours) {
+          this.logger.log(`DCA skipé : intervalle ${elapsedH.toFixed(1)}h < ${intervalHours}h (param optimisé)`);
+          return { success: false, reason: 'interval_non_atteint', elapsedH: Math.round(elapsedH * 10) / 10, intervalHours };
+        }
+      }
+    }
+
+    // ─── Paramètre optimisé : buy_threshold_pct (n'acheter que sur repli) ───
+    // Si > 0, l'achat n'a lieu que si le prix WETH a reculé d'au moins ce %
+    // depuis son plus haut récent (achat de repli). 0 = achat systématique.
+    const buyThresholdPct = strategy.buy_threshold_pct || 0;
+    if (buyThresholdPct > 0) {
+      const series = await this.priceService.getPriceSeries('WETH', 100);
+      if (series.length >= 5) {
+        const recentMax = Math.max(...series);
+        const current = series[series.length - 1];
+        const dropPct = recentMax > 0 ? ((recentMax - current) / recentMax) * 100 : 0;
+        if (dropPct < buyThresholdPct) {
+          this.logger.log(`DCA skipé : repli ${dropPct.toFixed(2)}% < seuil ${buyThresholdPct}% (param optimisé)`);
+          return { success: false, reason: 'seuil_repli_non_atteint', dropPct: Math.round(dropPct * 100) / 100, buyThresholdPct };
+        }
+      }
+    }
+
+    // ─── Paramètre optimisé : amount_per_buy (montant de base du cycle) ───
+    // On lit la config (injectée par l'optimiseur) au lieu d'une constante figée.
+    // Le plafond dur DCA_MAX_PER_TRADE_USD reste appliqué plus bas.
+    const configuredBase = parseFloat(strategy.amount_per_buy);
+    let buyAmount =
+      Number.isFinite(configuredBase) && configuredBase > 0
+        ? Math.min(configuredBase, DCA_MAX_PER_TRADE_USD)
+        : DCA_BASE_AMOUNT_USD;
 
     // 1. Smart DCA : ajustement basé sur les trades récents
     if (strategy.smart_dca) {
@@ -97,6 +148,11 @@ export class DcaService {
     const couplingMult = await this.getCouplingMultiplier();
     if (couplingMult !== 1) {
       buyAmount = buyAmount * couplingMult;
+    }
+
+    // 2bis. Pilotage adaptatif : facteur de taille Strategist × allocation Evaluator
+    if (modulation.sizeFactor !== 1) {
+      buyAmount = buyAmount * modulation.sizeFactor;
     }
 
     // 3. Recovery : facteur de réduction si drawdown modéré
@@ -118,6 +174,30 @@ export class DcaService {
     if (buyAmount < DCA_MIN_LEG_USD) {
       this.logger.warn(`DCA : montant total trop faible ($${buyAmount} < $${DCA_MIN_LEG_USD}), skip`);
       return { success: false, reason: 'montant_trop_faible', amount: buyAmount };
+    }
+
+    // Filtre de rentabilité minimum.
+    // En mode achat-de-repli (buy_threshold_pct > 0), l'entrée mise sur un rebond au
+    // moins égal au repli exigé : le rebond attendu doit couvrir le coût d'un
+    // aller-retour DEX + marge. En mode accumulation pur (seuil = 0), le DCA détient
+    // sur le long terme (pas d'aller-retour immédiat) → le filtre est ignoré.
+    if (buyThresholdPct > 0) {
+      const expectedMovePct = buyThresholdPct;
+      const minPP = await getMinProfitPct(this.prisma, 'dca');
+      const est = estimateRoundTripCost(buyAmount, minPP);
+      if (!passesProfitability(expectedMovePct, est)) {
+        this.logger.log(
+          `[RENTABILITÉ] DCA REFUSÉ : rebond attendu ${expectedMovePct.toFixed(2)}% < seuil ${est.breakevenPct.toFixed(2)}% (coût ${est.costPct.toFixed(2)}% + marge ${minPP.toFixed(2)}%)`,
+        );
+        return {
+          success: false,
+          reason: 'rentabilite_insuffisante',
+          expectedMovePct: Number(expectedMovePct.toFixed(2)),
+          breakevenPct: Number(est.breakevenPct.toFixed(2)),
+        };
+      }
+    } else {
+      this.logger.log('DCA : mode accumulation pur (seuil de repli = 0), filtre de rentabilité ignoré');
     }
 
     // ─── Répartition sur le panier diversifié (WETH 50 %, WBTC 30 %, ARB 20 %) ───
@@ -240,11 +320,19 @@ export class DcaService {
       },
     });
 
+    const minPP = await getMinProfitPct(this.prisma, 'dca');
+    const estRef = estimateRoundTripCost(DCA_BASE_AMOUNT_USD, minPP);
     return {
       enabled: this.enabled,
       strategy,
       lastTrade,
       todayTradeCount: todayTrades,
+      profitability: {
+        min_profit_pct: minPP,
+        round_trip_cost_pct_estimate: Number(estRef.costPct.toFixed(3)),
+        breakeven_move_pct_estimate: Number(estRef.breakevenPct.toFixed(3)),
+        note: 'En mode achat-de-repli (buy_threshold_pct > 0), le rebond attendu doit dépasser le seuil de breakeven ; en accumulation pure (seuil = 0) le filtre est ignoré. Ajustable via app_config: profitability.dca.minProfitPct ou profitability.minProfitPct.',
+      },
       baseAmount: DCA_BASE_AMOUNT_USD,
       minLegUsd: DCA_MIN_LEG_USD,
       frequency: '3h',

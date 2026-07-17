@@ -162,3 +162,51 @@ export function emaSeries(values: number[], period: number): number[] {
   }
   return out;
 }
+
+/**
+ * SMA incrémentale (moyenne mobile simple) — out[i] = moyenne des `period` dernières
+ * valeurs closes[i-period+1..i], ou null si i < period-1 (fidèle à sma() de indicators.ts,
+ * qui retourne null quand prices.length < period).
+ */
+export function smaSeries(values: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(values.length).fill(null);
+  if (period <= 0) return out;
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
+
+/**
+ * RSI incrémental (RSI simple, non-Wilder) — out[i] calculé sur les `period` derniers
+ * deltas closes[i-period+1..i] moins closes précédents. Retourne 50 (neutre) tant que
+ * i < period, fidèle à rsi() de indicators.ts (qui retourne 50 si length < period+1).
+ */
+export function rsiSeries(values: number[], period: number): number[] {
+  const n = values.length;
+  const out: number[] = new Array(n).fill(50);
+  if (period <= 0 || n < period + 1) return out;
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i < n; i++) {
+    const delta = values[i] - values[i - 1];
+    if (delta >= 0) gains += delta;
+    else losses += Math.abs(delta);
+    // Retirer le delta qui sort de la fenêtre glissante (position i-period).
+    const kOut = i - period;
+    if (kOut >= 1) {
+      const oldDelta = values[kOut] - values[kOut - 1];
+      if (oldDelta >= 0) gains -= oldDelta;
+      else losses -= Math.abs(oldDelta);
+    }
+    // Fenêtre pleine (period deltas) dès que i >= period.
+    if (i >= period) {
+      if (losses === 0) out[i] = 100;
+      else out[i] = 100 - 100 / (1 + gains / losses);
+    }
+  }
+  return out;
+}

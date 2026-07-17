@@ -49,6 +49,20 @@ export const MODULE_INTERVALS_MS: Record<string, number> = {
   auto_reoptimize: 3600000, // 1 h
   supervision: 300000, // 5 min
   strategy_evaluator: 900000, // 15 min
+  maintenance: 86400000, // 24 h — purge des tables historiques (anti-croissance illimitée)
+};
+
+/**
+ * Rétention (en jours) par table historique purgée par le module `maintenance`.
+ * price_history : 7 j (déjà borné aussi à 500 entrées/token par PriceService) ;
+ * les tables analytiques/décisionnelles : 30 j.
+ */
+export const RETENTION_DAYS: Record<string, number> = {
+  price_history: 7,
+  risk_metric: 30,
+  arbitrage_opportunity: 30,
+  coupling_decision: 30,
+  strategy_evaluation: 30,
 };
 
 function humanFreq(ms: number): string {
@@ -191,6 +205,9 @@ export class PipelineOrchestrator {
       // ─── Phase 6 RAPPORT ───
       await run('telegram_summary', 'Phase 6 RAPPORT', () => this.telegram.tickSummary());
 
+      // ─── Maintenance quotidienne : purge des tables historiques ───
+      await run('maintenance', 'Phase 6 RAPPORT', () => this.runMaintenance());
+
       // ─── Phase 7 OPTIMISER ───
       if (!skipReopt && (await due('auto_reoptimize'))) {
         this.currentPhase = 'Phase 7 OPTIMISER';
@@ -213,6 +230,58 @@ export class PipelineOrchestrator {
       this.running = false;
       this.logger.log(`[PIPELINE] === Cycle #${cycleNo} terminé (${this.lastCycleMs}ms total) ===`);
     }
+  }
+
+  /**
+   * Purge périodique des tables historiques pour éviter leur croissance illimitée.
+   * Supprime les enregistrements plus vieux que RETENTION_DAYS[table]. Idempotent et
+   * sûr (chaque suppression isolée dans son propre try/catch). Colonnes de date
+   * spécifiques à chaque table.
+   */
+  async runMaintenance(): Promise<void> {
+    const now = Date.now();
+    const cutoff = (days: number) => new Date(now - days * 86400000);
+    const results: string[] = [];
+
+    const purge = async (
+      label: string,
+      fn: () => Promise<{ count: number }>,
+    ): Promise<void> => {
+      try {
+        const { count } = await fn();
+        results.push(`${label}=${count}`);
+      } catch (e: any) {
+        this.logger.warn(`[MAINTENANCE] purge ${label} échouée: ${e?.message}`);
+      }
+    };
+
+    await purge('price_history', () =>
+      this.prisma.price_history.deleteMany({
+        where: { recorded_at: { lt: cutoff(RETENTION_DAYS.price_history) } },
+      }),
+    );
+    await purge('risk_metric', () =>
+      this.prisma.risk_metric.deleteMany({
+        where: { computed_at: { lt: cutoff(RETENTION_DAYS.risk_metric) } },
+      }),
+    );
+    await purge('arbitrage_opportunity', () =>
+      this.prisma.arbitrage_opportunity.deleteMany({
+        where: { detected_at: { lt: cutoff(RETENTION_DAYS.arbitrage_opportunity) } },
+      }),
+    );
+    await purge('coupling_decision', () =>
+      this.prisma.coupling_decision.deleteMany({
+        where: { created_at: { lt: cutoff(RETENTION_DAYS.coupling_decision) } },
+      }),
+    );
+    await purge('strategy_evaluation', () =>
+      this.prisma.strategy_evaluation.deleteMany({
+        where: { created_at: { lt: cutoff(RETENTION_DAYS.strategy_evaluation) } },
+      }),
+    );
+
+    this.logger.log(`[MAINTENANCE] Purge tables historiques — supprimés: ${results.join(', ')}`);
   }
 
   getStatus() {

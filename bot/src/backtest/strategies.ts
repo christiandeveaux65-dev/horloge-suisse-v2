@@ -8,7 +8,7 @@
  *  - Un portefeuille unique (cash USDT + positions par token) partagé par la stratégie.
  */
 import { rsi, bollingerBands } from '../indicators';
-import { emaSeries } from './metrics';
+import { smaSeries, rsiSeries } from './metrics';
 import { Candle, SimTrade, EquityPoint, SimResult } from './backtest.types';
 
 interface Position {
@@ -112,7 +112,12 @@ interface TokenCursor {
   idx: number; // index de la dernière bougie connue (open_time <= t courant)
   lastPrice: number;
   closes: number[]; // closes[0..idx]
-  ema?: { short: number[]; long: number[] };
+  // Séries pré-calculées pour Momentum (aligné sur la logique live computeSignal).
+  mom?: {
+    smaShort: (number | null)[];
+    smaLong: (number | null)[];
+    rsi: number[];
+  };
 }
 
 export interface SimConfig {
@@ -135,13 +140,20 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
     cursors.set(token, { candles, idx: -1, lastPrice: 0, closes: [] });
   }
 
-  // Pré-calcul EMA (momentum) — emaSeries est incrémental, aucun look-ahead.
+  // Pré-calcul SMA + RSI (momentum) — aligné sur la logique live (computeSignal :
+  // croisement SMA courte/longue + RSI + continuation de tendance). Séries
+  // incrémentales O(n), aucun look-ahead (out[i] n'utilise que closes[0..i]).
   if (cfg.strategy === 'momentum') {
-    const emaShort = Math.max(2, parseInt(cfg.params.emaShort ?? 10, 10));
-    const emaLong = Math.max(3, parseInt(cfg.params.emaLong ?? 30, 10));
+    const maShort = Math.max(2, parseInt(cfg.params.emaShort ?? cfg.params.maShort ?? 10, 10));
+    const maLong = Math.max(3, parseInt(cfg.params.emaLong ?? cfg.params.maLong ?? 30, 10));
+    const rsiPeriod = Math.max(2, parseInt(cfg.params.rsiPeriod ?? 14, 10));
     for (const cur of cursors.values()) {
       const closesFull = cur.candles.map((c) => c.close);
-      cur.ema = { short: emaSeries(closesFull, emaShort), long: emaSeries(closesFull, emaLong) };
+      cur.mom = {
+        smaShort: smaSeries(closesFull, maShort),
+        smaLong: smaSeries(closesFull, maLong),
+        rsi: rsiSeries(closesFull, rsiPeriod),
+      };
     }
   }
 
@@ -324,7 +336,13 @@ function stepMeanReversion(
   }
 }
 
-// ─────────────────────── Momentum (EMA crossover) ──────────────────
+// ──────────── Momentum (SMA + RSI + tendance, aligné sur le live) ────────────
+// Réplique fidèlement computeSignal() de indicators.ts utilisé en production :
+// signal d'achat = croisement SMA haussier OU RSI qui repasse au-dessus de la
+// survente OU continuation de tendance ; signal de vente = croisement baissier
+// OU RSI en surchauffe. Sorties dans l'ordre du live : stop-loss dur, trailing
+// stop, puis signal de vente. (Le holding minimum du live opère à l'échelle de
+// la minute ; sur des bougies 1h/4h il n'a aucun effet et n'est donc pas répliqué.)
 function stepMomentum(
   pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>, t: number,
   momPeak: Map<string, number>,
@@ -334,49 +352,83 @@ function stepMomentum(
   );
   const stopLossPct = parseFloat(cfg.params.stopLossPct ?? 0); // 0 = désactivé
   const trailingStopPct = parseFloat(cfg.params.trailingStopPct ?? 0); // 0 = désactivé
+  const maShort = Math.max(2, parseInt(cfg.params.emaShort ?? cfg.params.maShort ?? 10, 10));
+  const maLong = Math.max(3, parseInt(cfg.params.emaLong ?? cfg.params.maLong ?? 30, 10));
+  const rsiPeriod = Math.max(2, parseInt(cfg.params.rsiPeriod ?? 14, 10));
+  const rsiOversold = parseFloat(cfg.params.rsiOversold ?? 35);
+  const rsiOverbought = parseFloat(cfg.params.rsiOverbought ?? 70);
 
   for (const [token, cur] of cursors.entries()) {
-    if (cur.idx < 1 || !cur.ema || cur.lastPrice <= 0) continue;
+    if (cur.idx < 1 || !cur.mom || cur.lastPrice <= 0) continue;
     const i = cur.idx;
-    const sNow = cur.ema.short[i];
-    const lNow = cur.ema.long[i];
-    const sPrev = cur.ema.short[i - 1];
-    const lPrev = cur.ema.long[i - 1];
+    const len = i + 1; // équivalent de prices.length dans computeSignal
     const price = cur.lastPrice;
     const p = pf['positions'].get(token);
-    const hasPos = p && p.amountToken > 0;
+    const hasPos = !!(p && p.amountToken > 0);
 
-    // Trailing stop : suit le plus haut atteint depuis l'entrée ; sortie si repli de trailingStopPct %.
-    if (hasPos && trailingStopPct > 0) {
-      const peak = Math.max(momPeak.get(token) ?? price, price);
-      momPeak.set(token, peak);
-      if (peak > 0 && price <= peak * (1 - trailingStopPct / 100)) {
-        pf.sell(token, 'all', price, t, 'mom_trailing_stop');
-        momPeak.delete(token);
-        continue;
+    // ── Sorties (uniquement si position ouverte) ──
+    if (hasPos) {
+      // 1) Stop-loss dur : sortie si le prix chute sous le coût moyen d'entrée.
+      if (stopLossPct > 0) {
+        const avgCost = p!.costUsd / p!.amountToken;
+        if (avgCost > 0 && price <= avgCost * (1 - stopLossPct / 100)) {
+          pf.sell(token, 'all', price, t, 'mom_stop_loss');
+          momPeak.delete(token);
+          continue;
+        }
+      }
+      // 2) Trailing stop : suit le plus haut atteint ; sortie si repli de trailingStopPct %.
+      if (trailingStopPct > 0) {
+        const peak = Math.max(momPeak.get(token) ?? price, price);
+        momPeak.set(token, peak);
+        if (peak > 0 && price <= peak * (1 - trailingStopPct / 100)) {
+          pf.sell(token, 'all', price, t, 'mom_trailing_stop');
+          momPeak.delete(token);
+          continue;
+        }
       }
     }
 
-    // Stop-loss : sortie si le prix chute sous le coût moyen d'entrée.
-    if (hasPos && stopLossPct > 0) {
-      const avgCost = p!.costUsd / p!.amountToken;
-      if (avgCost > 0 && price <= avgCost * (1 - stopLossPct / 100)) {
-        pf.sell(token, 'all', price, t, 'mom_stop_loss');
-        momPeak.delete(token);
-        continue;
-      }
-    }
+    // ── Calcul du signal (fidèle à computeSignal) ──
+    const smaShort = cur.mom.smaShort[i];
+    const smaLongVal = cur.mom.smaLong[i];
+    const smaShortPrev = len > maShort ? cur.mom.smaShort[i - 1] : null;
+    const smaLongPrev = len > maLong ? cur.mom.smaLong[i - 1] : null;
+    const rsiVal = cur.mom.rsi[i];
+    const rsiPrev = len > rsiPeriod + 1 ? cur.mom.rsi[i - 1] : null;
 
-    const crossUp = sPrev <= lPrev && sNow > lNow;
-    const crossDown = sPrev >= lPrev && sNow < lNow;
+    const crossUp =
+      smaShort !== null && smaLongVal !== null &&
+      smaShortPrev !== null && smaLongPrev !== null &&
+      smaShortPrev <= smaLongPrev && smaShort > smaLongVal;
 
-    if (crossUp && !hasPos) {
+    const crossDown =
+      smaShort !== null && smaLongVal !== null &&
+      smaShortPrev !== null && smaLongPrev !== null &&
+      smaShortPrev >= smaLongPrev && smaShort < smaLongVal;
+
+    const rsiRecovering =
+      rsiPrev !== null && rsiPrev < rsiOversold && rsiVal >= rsiOversold;
+    const rsiRising = rsiPrev !== null && rsiVal > rsiPrev;
+    const rsiHot = rsiVal >= rsiOverbought;
+
+    const trendUpEntry =
+      smaShort !== null && smaLongVal !== null &&
+      smaShort > smaLongVal &&
+      rsiVal < rsiOverbought && rsiRising &&
+      price >= smaShort;
+
+    const buySignal = crossUp || rsiRecovering || trendUpEntry;
+    const sellSignal = crossDown || rsiHot;
+
+    // ── Entrée / sortie sur signal ──
+    if (buySignal && !hasPos) {
       const size = Math.min(positionSizeUsd, pf.cash);
-      if (size >= 5 && pf.buy(token, size, price, t, 'mom_cross_up')) {
+      if (size >= 5 && pf.buy(token, size, price, t, 'mom_entry')) {
         momPeak.set(token, price);
       }
-    } else if (crossDown && hasPos) {
-      pf.sell(token, 'all', price, t, 'mom_cross_down');
+    } else if (sellSignal && hasPos) {
+      pf.sell(token, 'all', price, t, 'mom_signal_sell');
       momPeak.delete(token);
     }
   }

@@ -8,6 +8,8 @@ import { rsi, bollingerBands } from '../indicators';
 import {
   CHAIN, MAX_TRADE_SIZE_MR, MAX_EXPOSURE_PER_TOKEN, MAX_TOTAL_EXPOSURE_MR,
 } from '../constants';
+import { getStrategyModulation } from '../common/strategy-modulation';
+import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
 
 /**
  * Mean Reversion — RSI(14) + Bollinger Bands
@@ -159,6 +161,12 @@ export class MeanReversionService implements OnModuleInit {
       return { token, action: 'skip', reason: 'coupling_surchauffe' };
     }
 
+    // Pilotage adaptatif (Strategist × Strategy Evaluator).
+    const modulation = await getStrategyModulation(this.prisma, 'mean_reversion');
+    if (!modulation.active) {
+      return { token, action: 'skip', reason: 'directive_inactive', modulation: modulation.reason };
+    }
+
     // Vérifier les limites hardcodées
     const totalExposure = await this.getTotalExposure();
     if (totalExposure >= MAX_TOTAL_EXPOSURE_MR) {
@@ -170,8 +178,12 @@ export class MeanReversionService implements OnModuleInit {
       return { token, action: 'skip', reason: `exposition max token ($${MAX_EXPOSURE_PER_TOKEN})` };
     }
 
-    // Calculer la taille du trade
+    // Calculer la taille du trade — base = trade_size_usd (param optimisé),
+    // bornée par le plafond dur et les expositions restantes.
+    const desiredSize = parseFloat(cfg.trade_size_usd);
+    const baseSize = Number.isFinite(desiredSize) && desiredSize > 0 ? desiredSize : MAX_TRADE_SIZE_MR;
     let sizeUsd = Math.min(
+      baseSize,
       MAX_TRADE_SIZE_MR,
       MAX_TOTAL_EXPOSURE_MR - totalExposure,
       MAX_EXPOSURE_PER_TOKEN - tokenExposure,
@@ -186,12 +198,38 @@ export class MeanReversionService implements OnModuleInit {
     if (couplingMult > 0 && couplingMult !== 1) {
       sizeUsd = sizeUsd * couplingMult;
     }
+
+    // Pilotage adaptatif : facteur de taille Strategist × allocation Evaluator.
+    if (modulation.sizeFactor !== 1) {
+      sizeUsd = sizeUsd * modulation.sizeFactor;
+    }
     // Re-plafonnement dur après boost coupling (aucune borne ne peut être dépassée).
     sizeUsd = Math.min(sizeUsd, MAX_TRADE_SIZE_MR);
 
     sizeUsd = Math.floor(sizeUsd * 100) / 100;
     if (sizeUsd < 5) {
       return { token, action: 'skip', reason: 'taille trop faible' };
+    }
+
+    // Filtre de rentabilité minimum : le retour vers la moyenne (bande médiane de
+    // Bollinger) doit dépasser le coût de l'aller-retour DEX + marge.
+    // Proxy du mouvement attendu = distance de réversion (mid - prix d'entrée).
+    if (bands && currentPrice > 0) {
+      const expectedMovePct = ((bands.mid - currentPrice) / currentPrice) * 100;
+      const minPP = await getMinProfitPct(this.prisma, 'mean_reversion');
+      const est = estimateRoundTripCost(sizeUsd, minPP);
+      if (!passesProfitability(expectedMovePct, est)) {
+        this.logger.log(
+          `[RENTABILITÉ] MR ${token} REFUSÉ : réversion attendue ${expectedMovePct.toFixed(2)}% < seuil ${est.breakevenPct.toFixed(2)}% (coût ${est.costPct.toFixed(2)}% + marge ${minPP.toFixed(2)}%)`,
+        );
+        return {
+          token,
+          action: 'skip',
+          reason: 'rentabilite_insuffisante',
+          expectedMovePct: Number(expectedMovePct.toFixed(2)),
+          breakevenPct: Number(est.breakevenPct.toFixed(2)),
+        };
+      }
     }
 
     // Exécuter l'achat
@@ -277,9 +315,17 @@ export class MeanReversionService implements OnModuleInit {
       include: { positions: { where: { status: 'open' } } },
     });
     const totalExposure = await this.getTotalExposure();
+    const minPP = await getMinProfitPct(this.prisma, 'mean_reversion');
+    const estRef = estimateRoundTripCost(MAX_TRADE_SIZE_MR, minPP);
 
     return {
       enabled: this.enabled,
+      profitability: {
+        min_profit_pct: minPP,
+        round_trip_cost_pct_estimate: Number(estRef.costPct.toFixed(3)),
+        breakeven_move_pct_estimate: Number(estRef.breakevenPct.toFixed(3)),
+        note: 'Une entrée MR n\'a lieu que si la réversion attendue vers la moyenne dépasse le seuil de breakeven. Ajustable via app_config: profitability.mean_reversion.minProfitPct ou profitability.minProfitPct.',
+      },
       limits: {
         maxTradeSize: MAX_TRADE_SIZE_MR,
         maxPerToken: MAX_EXPOSURE_PER_TOKEN,

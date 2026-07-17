@@ -8,6 +8,7 @@ import { BlockchainService } from '../blockchain/blockchain.service';
 import {
   ARB_MIN_SPREAD_BPS, ARB_MAX_SPREAD_BPS, ARB_MAX_TRADE_USD,
 } from '../constants';
+import { getStrategyModulation } from '../common/strategy-modulation';
 
 /**
  * Arbitrage DEX — détecte une divergence entre le prix exécutable on-chain (quote Uniswap)
@@ -54,18 +55,12 @@ export class ArbitrageService implements OnModuleInit {
         });
         this.logger.log('Arbitrage RÉACTIVÉ : config créée (conservatrice)');
       } else {
-        // Réactive et normalise sur les paramètres conservateurs.
-        await this.prisma.arbitrage_config.update({
-          where: { id: cfg.id },
-          data: {
-            active: true,
-            paused: false,
-            min_spread_bps: ARB_MIN_SPREAD_BPS,
-            max_amount_per_arb: String(ARB_MAX_TRADE_USD),
-          },
-        });
+        // Config déjà présente : on NE réécrit PAS ses paramètres au démarrage afin
+        // de respecter tout réglage manuel (spread, ticket, active/paused) persisté en
+        // DB. La normalisation conservatrice ne s'applique qu'à la création initiale.
         this.logger.log(
-          `Arbitrage RÉACTIVÉ : spread min ${ARB_MIN_SPREAD_BPS} bps, ticket max $${ARB_MAX_TRADE_USD}, cron 5 min`,
+          `Arbitrage : config existante conservée (spread min ${cfg.min_spread_bps} bps, ` +
+            `ticket max $${cfg.max_amount_per_arb}, active=${cfg.active}, paused=${cfg.paused})`,
         );
       }
     } catch (err: any) {
@@ -144,11 +139,21 @@ export class ArbitrageService implements OnModuleInit {
       return { token, action: 'skip', reason: 'prix_reference_indisponible' };
     }
 
+    // Pilotage adaptatif (Strategist × Strategy Evaluator).
+    const modulation = await getStrategyModulation(this.prisma, 'arbitrage');
+    if (!modulation.active) {
+      return { token, action: 'skip', reason: 'directive_inactive', modulation: modulation.reason };
+    }
+
     // Taille de ticket réelle (ex. ~$200). On cote CETTE taille en unités de token
     // plutôt que « 1 token entier » : coter 1 WBTC (~$65 000) sur un pool Arbitrum peu
     // profond génère un impact de prix massif (~-640 bps) interprété à tort comme une
     // anomalie. En cotant le notionnel réel, l'écart reflète l'exécution réelle.
-    const tradeUsd = Math.min(ARB_MAX_TRADE_USD, parseFloat(cfg.max_amount_per_arb));
+    let tradeUsd = Math.min(ARB_MAX_TRADE_USD, parseFloat(cfg.max_amount_per_arb));
+    // Facteur de taille Strategist × allocation Evaluator, borné par le plafond dur.
+    if (modulation.sizeFactor !== 1) {
+      tradeUsd = Math.min(ARB_MAX_TRADE_USD, tradeUsd * modulation.sizeFactor);
+    }
     const tokenQty = tradeUsd / refPrice; // quantité de token pour ~tradeUsd
     if (!(tokenQty > 0) || !Number.isFinite(tokenQty)) {
       return { token, action: 'skip', reason: 'quantite_invalide' };

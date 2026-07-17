@@ -88,7 +88,9 @@ export class CouplingService {
 
     const trend = clamp((spread / 0.05) * 40, -40, 40);
     const rsiComp = clamp(((rsiVal - 50) / 35) * 35, -35, 35);
-    const ddComp = clamp(25 + (dd / 0.2) * 50, -25, 25);
+    // Un drawdown (dd >= 0) doit TIRER le score vers le négatif → régime
+    // capitulation → boost accumulation. dd=0 → 0, dd>=20% → -50 (plancher).
+    const ddComp = clamp(-(dd / 0.2) * 50, -50, 0);
     const score = clamp(trend + rsiComp + ddComp, -100, 100);
 
     // Classification du régime

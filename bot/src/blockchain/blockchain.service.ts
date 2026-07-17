@@ -18,6 +18,11 @@ import {
   AAVE_POOL, AAVE_VARIABLE_RATE_MODE, AAVE_REFERRAL_CODE, AAVE_BASE_DECIMALS, AAVE_HF_DECIMALS,
 } from '../constants';
 
+// Friction de simulation (dry-run) — reflète des coûts d'exécution réalistes.
+const SIM_POOL_FEE = 0.003; // frais de pool Uniswap : 0,3 %
+const SIM_SLIPPAGE = 0.001; // slippage estimé : 0,1 %
+const SIM_GAS_USD = 0.15; // coût de gas estimé par trade (~0,15 $)
+
 // ABI minimaux pour Uniswap V3
 const QUOTER_ABI = [
   'function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96)) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
@@ -544,25 +549,43 @@ export class BlockchainService {
         const srcPrice = await this.priceService.getPrice(sourceToken);
         const tgtPrice = await this.priceService.getPrice(targetToken);
         if (!(srcPrice > 0) || !(tgtPrice > 0)) throw new Error('prix KuCoin nul');
-        amountOut = (amountInNum * srcPrice) / tgtPrice;
+        // Correctif audit : appliquer la friction réaliste en dry-run.
+        //  • frais de pool Uniswap : 0,3 %
+        //  • slippage estimé       : 0,1 %
+        amountOut =
+          (amountInNum * srcPrice) / tgtPrice *
+          (1 - SIM_POOL_FEE) *
+          (1 - SIM_SLIPPAGE);
       } catch (kuErr: any) {
-        // Fallback : quote on-chain Uniswap
+        // Fallback : quote on-chain Uniswap (les frais de pool sont déjà inclus dans le quote,
+        // on n'applique donc que le slippage estimé pour ne pas double-compter les frais).
         this.logger.warn(`[DRY-RUN] KuCoin indisponible (${kuErr.message}), fallback quote on-chain`);
         const quote = await this.getQuote(sourceToken, targetToken, amountIn);
-        amountOut = parseFloat(quote.amountOut);
+        amountOut = parseFloat(quote.amountOut) * (1 - SIM_SLIPPAGE);
       }
 
       if (!(amountOut > 0)) throw new Error('amountOut simulé nul (fail-closed)');
 
+      // Gas estimé ~0,15 $/trade, converti en ETH via le prix WETH (cohérent avec le
+      // calcul de coût de gas côté portfolio/strategy-evaluator qui fait gasEth × prixWETH).
+      let gasPaidEth = '0';
+      try {
+        const ethPrice = await this.priceService.getPrice('WETH');
+        if (ethPrice > 0) gasPaidEth = (SIM_GAS_USD / ethPrice).toString();
+      } catch {
+        /* prix ETH indisponible : gas laissé à 0 */
+      }
+
       this.logger.log(
-        `[DRY-RUN] Swap simulé : ${amountIn} ${sourceToken} → ${amountOut} ${targetToken}`,
+        `[DRY-RUN] Swap simulé : ${amountIn} ${sourceToken} → ${amountOut} ${targetToken} ` +
+          `(frais ${(SIM_POOL_FEE * 100).toFixed(1)}% + slippage ${(SIM_SLIPPAGE * 100).toFixed(1)}%, gas ~$${SIM_GAS_USD})`,
       );
       return {
         success: true,
         amountIn,
         amountOut: amountOut.toString(),
         effectivePrice: (amountInNum / amountOut).toString(),
-        gasPaid: '0',
+        gasPaid: gasPaidEth,
         // Hash simulé via randomUUID (jamais Math.random / collisions)
         txHash: `dry-run-${randomUUID()}`,
       };

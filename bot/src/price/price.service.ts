@@ -79,15 +79,23 @@ export class PriceService {
     return result;
   }
 
-  /** Obtenir la série de prix historiques pour les indicateurs */
+  /**
+   * Obtenir la série de prix historiques pour les indicateurs.
+   * On récupère les `count` prix les PLUS RÉCENTS (orderBy desc), puis on inverse
+   * pour restituer l'ordre chronologique (ancien → récent) attendu par les indicateurs.
+   * (Correctif : l'ancienne version prenait les `count` plus ANCIENS enregistrements.)
+   */
   async getPriceSeries(token: string, count: number): Promise<number[]> {
     const records = await this.prisma.price_history.findMany({
       where: { token: token.toUpperCase(), chain: CHAIN },
-      orderBy: { recorded_at: 'asc' },
+      orderBy: { recorded_at: 'desc' },
       take: count,
       select: { price_usd: true },
     });
-    return records.map((r) => parseFloat(r.price_usd)).filter((p) => p > 0);
+    return records
+      .map((r) => parseFloat(r.price_usd))
+      .filter((p) => p > 0)
+      .reverse();
   }
 
   /** Enregistrer un prix en historique */
@@ -107,10 +115,34 @@ export class PriceService {
     for (const symbol of tokenSymbols) {
       try {
         await this.getPrice(symbol);
+        // Purge périodique : borne l'historique à MAX_HISTORY_PER_TOKEN entrées/token.
+        await this.purgeHistory(symbol).catch(() => {});
       } catch (err: any) {
         this.logger.warn(`Enregistrement prix échoué pour ${symbol}: ${err.message}`);
       }
     }
+  }
+
+  /**
+   * Purge l'historique de prix d'un token en ne conservant que les `keep` plus récents.
+   * Évite la croissance illimitée de price_history (perf des requêtes + volume DB).
+   */
+  private static readonly MAX_HISTORY_PER_TOKEN = 500;
+  async purgeHistory(token: string, keep = PriceService.MAX_HISTORY_PER_TOKEN): Promise<void> {
+    const tokenUpper = token.toUpperCase();
+    // Le (keep+1)-ième enregistrement le plus récent marque la limite de conservation.
+    const boundary = await this.prisma.price_history.findMany({
+      where: { token: tokenUpper, chain: CHAIN },
+      orderBy: { recorded_at: 'desc' },
+      skip: keep,
+      take: 1,
+      select: { recorded_at: true },
+    });
+    if (boundary.length === 0) return; // moins de `keep` entrées : rien à purger
+    const cutoff = boundary[0].recorded_at;
+    await this.prisma.price_history.deleteMany({
+      where: { token: tokenUpper, chain: CHAIN, recorded_at: { lte: cutoff } },
+    });
   }
 
   private async fetchKuCoin(token: string): Promise<number> {

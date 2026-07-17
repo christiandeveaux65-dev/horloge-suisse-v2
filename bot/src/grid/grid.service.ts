@@ -5,6 +5,8 @@ import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
 import { GRID_BUDGET_USD, GRID_LEVELS, GRID_PER_LEVEL_USD } from '../constants';
+import { getStrategyModulation } from '../common/strategy-modulation';
+import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
 
 /**
  * Grid Trading — WETH/USDC
@@ -77,8 +79,12 @@ export class GridService {
     }
     const currentPrice = prices[prices.length - 1];
 
-    // Fourchette auto : ±3.5% autour du prix courant (borne dure de sécurité).
-    const rangePct = 3.5;
+    // Fourchette : lit range_pct (param optimisé par l'optimiseur), borné [1%, 10%]
+    // pour la sécurité. Fallback 3.5% si non renseigné.
+    const cfgRange = Number(cfg.range_pct);
+    const rangePct = Number.isFinite(cfgRange) && cfgRange > 0
+      ? Math.max(1, Math.min(10, cfgRange))
+      : 3.5;
     let lower = parseFloat(cfg.price_lower);
     let upper = parseFloat(cfg.price_upper);
 
@@ -116,14 +122,34 @@ export class GridService {
       (s: number, o: any) => s + parseFloat(o.amount) * parseFloat(o.price), 0,
     );
     const budget = Math.min(parseFloat(cfg.budget_usd), GRID_BUDGET_USD);
-    const perLevelUsd = Math.min(GRID_PER_LEVEL_USD, budget / levels);
+    // Pilotage adaptatif (Strategist × Strategy Evaluator) : gate + facteur de taille.
+    const modulation = await getStrategyModulation(this.prisma, 'grid');
+    let perLevelUsd = Math.min(GRID_PER_LEVEL_USD, budget / levels);
+    if (modulation.sizeFactor !== 1) {
+      perLevelUsd = Math.min(GRID_PER_LEVEL_USD, perLevelUsd * modulation.sizeFactor);
+    }
 
     // Niveau courant
     const currentLevel = Math.floor((currentPrice - lower) / step);
     const results: any[] = [];
 
-    // Achat : le prix est dans le bas de la grille et budget disponible
-    if (currentPrice <= lower + step * Math.floor(levels / 2) && deployedUsd + perLevelUsd <= budget) {
+    // Filtre de rentabilité minimum : le profit d'un cycle de grille = un pas (step).
+    // Si l'écart entre deux niveaux ne couvre pas le coût de l'aller-retour DEX + marge,
+    // les NOUVEAUX achats sont refusés (les ventes de liquidation restent autorisées).
+    const stepPct = currentPrice > 0 ? (step / currentPrice) * 100 : 0;
+    const minPP = await getMinProfitPct(this.prisma, 'grid');
+    const est = estimateRoundTripCost(perLevelUsd, minPP);
+    const gridProfitable = passesProfitability(stepPct, est);
+    if (!gridProfitable) {
+      this.logger.log(
+        `[RENTABILITÉ] Grid ${token} achats REFUSÉS : pas de grille ${stepPct.toFixed(2)}% < seuil ${est.breakevenPct.toFixed(2)}% (coût ${est.costPct.toFixed(2)}% + marge ${minPP.toFixed(2)}%)`,
+      );
+    }
+
+    // Achat : le prix est dans le bas de la grille et budget disponible.
+    // La directive du Strategy Evaluator peut couper les NOUVEAUX achats (les ventes
+    // de liquidation restent autorisées pour dénouer les positions existantes).
+    if (gridProfitable && modulation.active && currentPrice <= lower + step * Math.floor(levels / 2) && deployedUsd + perLevelUsd <= budget) {
       // Éviter les doublons au même niveau
       const existingAtLevel = await this.prisma.grid_order.findFirst({
         where: { config_id: cfg.id, side: 'buy', status: 'filled', price: currentPrice.toString() },
@@ -200,12 +226,20 @@ export class GridService {
     const deployedUsd = filledBuys.reduce(
       (s: number, o: any) => s + parseFloat(o.amount) * parseFloat(o.price), 0,
     );
+    const minPP = await getMinProfitPct(this.prisma, 'grid');
+    const estRef = estimateRoundTripCost(GRID_PER_LEVEL_USD, minPP);
     return {
       enabled: this.enabled,
       schedule: '0 */3 * * * * (toutes les 3 min)',
       budgetUsd: GRID_BUDGET_USD,
       perLevelUsd: GRID_PER_LEVEL_USD,
       levels: GRID_LEVELS,
+      profitability: {
+        min_profit_pct: minPP,
+        round_trip_cost_pct_estimate: Number(estRef.costPct.toFixed(3)),
+        breakeven_move_pct_estimate: Number(estRef.breakevenPct.toFixed(3)),
+        note: 'Les achats de grille sont refusés si le pas de grille (%) ne dépasse pas le seuil de breakeven. Ajustable via app_config: profitability.grid.minProfitPct ou profitability.minProfitPct.',
+      },
       deployedUsd,
       config: cfg ? { ...cfg, orders: undefined, openBuys: filledBuys.length } : null,
     };

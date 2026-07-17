@@ -670,3 +670,28 @@ model supervision_alert {
   @@index([created_at])
   @@index([category, created_at])
 }
+
+model strategy_evaluation {
+  id              String   @id @default(uuid())
+  regime          String   @default("RANGE")
+  window_hours    Int      @default(72)
+  total_trades    Int      @default(0)
+  scores          String   @default("[]")
+  allocations     String   @default("{}")
+  recommendations String   @default("[]")
+  created_at      DateTime @default(now())
+
+  @@index([created_at])
+}
+
+model strategy_directive {
+  id                         String   @id @default(uuid())
+  strategy                   String   @unique
+  recommended_active         Boolean  @default(true)
+  recommended_allocation_pct Float    @default(0)
+  score                      Float    @default(0)
+  regime                     String   @default("RANGE")
+  reason                     String   @default("")
+  updated_at                 DateTime @updatedAt
+  created_at                 DateTime @default(now())
+}
