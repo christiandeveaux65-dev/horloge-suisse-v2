@@ -85,14 +85,16 @@ export const MAX_TRADE_SIZE_MR = 100;   // $100 max par trade
 export const MAX_EXPOSURE_PER_TOKEN = 400; // $400 max par token
 export const MAX_TOTAL_EXPOSURE_MR = 800; // $800 total MR
 
-// ─── DCA (optimisé Phase 1 — juillet 2026) ───
-// Ancien réglage : $0.50 / achat toutes les 15 min (~96 achats/jour) → le gas (~$0.10-0.30)
-// dépassait le gain sur ces micro-achats. Nouveau réglage : $7 / achat toutes les 3 h
-// (~8 achats/jour), soit un ticket suffisant pour amortir le gas.
-export const DCA_BASE_AMOUNT_USD = 7; // ~$7 par cycle (plage cible $5-10)
-export const DCA_MAX_PER_TRADE_USD = 10; // plafond dur par achat DCA (total panier)
-// Montant minimum par leg (jambe) du panier — LIMITE INTOUCHABLE ($0.50).
-export const DCA_MIN_LEG_USD = 0.5;
+// ─── DCA (optimisé Phase 3 — juillet 2026) ───
+// Historique : $0.50 (~96/jour) puis $7 / 3 h. Problème observé : le montant $7 réparti
+// sur 3 jambes (WETH 50 %, WBTC 30 %, ARB 20 %) puis réduit par le smart-DCA (×0.5)
+// produisait des jambes minuscules ($0.93-$3) où le gas rongeait le gain.
+// Phase 3 : ticket relevé à $24 / achat toutes les 3 h (~8 achats/jour), jambes ≥ $3
+// (WETH $12 / WBTC $7.2 / ARB $4.8), pour un aller-retour DEX rentable après frais.
+export const DCA_BASE_AMOUNT_USD = 24; // ~$24 par cycle (plage cible $20-30)
+export const DCA_MAX_PER_TRADE_USD = 40; // plafond dur par achat DCA (total panier)
+// Montant minimum par leg (jambe) du panier : $3 pour amortir le gas + frais de pool.
+export const DCA_MIN_LEG_USD = 3;
 // Panier DCA diversifié (recommandation analyste) : WETH 50 %, WBTC 30 %, ARB 20 %.
 // La somme des poids = 1. Chaque cycle répartit le montant total selon ces poids.
 export const DCA_BASKET: { token: string; weight: number }[] = [
@@ -227,10 +229,27 @@ export const AAVE_REFERRAL_CODE = 0;
 export const AAVE_BASE_DECIMALS = 8;
 export const AAVE_HF_DECIMALS = 18;
 
-// ─── Grid Trading ───
-export const GRID_BUDGET_USD = 1000;
-export const GRID_LEVELS = 15;
+// ─── Grid Trading (recalibré Phase 3 — juillet 2026) ───
+// Problème observé : avec 15 niveaux sur une fourchette ±3.5 % (largeur 7 %), le pas
+// entre niveaux valait ~0.47 %, TRÈS en-dessous du seuil de rentabilité aller-retour
+// (~2.1 % = frais 0.8 % + slippage + gas + marge 1 %). Résultat : le filtre de
+// rentabilité refusait quasiment TOUS les achats → grille morte (1 trade / 50).
+// Phase 3 : 5 niveaux sur une fourchette ±4 % (largeur 8 %) → pas ~1.6 %, au-dessus
+// du breakeven grille recalibré (marge plafonnée à 0.4 % → breakeven ~1.5 %).
+// GRID_BUDGET_USD = plafond de sécurité du capital grid. Relevé 1000 → 4000 pour que
+// la directive du Strategy Evaluator (allocation ~46 % ≈ $3600) gouverne réellement le
+// capital grid : sinon Math.min(cfg.budget_usd, GRID_BUDGET_USD) neutralisait la directive.
+export const GRID_BUDGET_USD = 4000;
+export const GRID_LEVELS = 5;
 export const GRID_PER_LEVEL_USD = 100;
+// Fourchette par défaut (demi-largeur en %) si range_pct non renseigné en config.
+export const GRID_DEFAULT_RANGE_PCT = 4;
+// Marge de profit MAX imposée à la grille (stratégie haute fréquence, petite marge) :
+// la grille plafonne minProfitPct à cette valeur pour rester active sur des pas ~1.5 %.
+export const GRID_MAX_MARGIN_PCT = 0.4;
+// Pas cible (en %) entre niveaux : si la config héritée produit un pas beaucoup plus
+// large, on augmente le nombre effectif de niveaux pour trader plus souvent (≥ breakeven).
+export const GRID_TARGET_STEP_PCT = 2;
 
 // ─── Arbitrage (réactivé Phase finale — paramètres conservateurs, reco analyste) ───
 // Ancien réglage agressif (50 bps, $500, cron 2 min) non rentable → refonte prudente :
@@ -281,6 +300,10 @@ export const SHORT_COLLATERAL_USD = 50;     // collatéral USD par SHORT
 export const SHORT_LEVERAGE = 2;            // levier fixe 2× (modéré)
 export const SHORT_MAX_POSITIONS = 3;       // nombre max de SHORTs ouverts simultanés
 export const SHORT_MAX_DRAWDOWN_PCT = 5;    // stop drawdown max identique à la Phase 1
+// Phase 3 : seuil RSI d'ouverture SHORT assoupli (75 → 65) pour que les shorts se
+// déclenchent réellement. Combiné à un « touch » de la bande supérieure (>=) au lieu
+// d'un breakout strict (>), et autorisé aussi en régime RANGE (pas seulement BEAR).
+export const SHORT_RSI_THRESHOLD = 65;
 
 // ─── Momentum budgets ───
 export const MOMENTUM_ALTS_BUDGET_USD = 2000;

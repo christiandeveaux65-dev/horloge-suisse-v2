@@ -312,22 +312,31 @@ export class MomentumService implements OnModuleInit {
       // Ouvre un SHORT via GMX Perps pour capter la baisse.
       if (snap.signal === 'sell' && snap.latestPrice && openPositions.length === 0
           && SHORT_ALLOWED_TOKENS.includes(token) && couplingMult > 0) {
-        // Confirme le régime bear via la table market_regime (Strategy Evaluator).
+        // Phase 3 : régime autorisé assoupli — le SHORT momentum se déclenche en BEAR
+        // (bear/downtrend) MAIS AUSSI en RANGE (marché sans tendance : un signal sell
+        // momentum y capte les rejets du haut de fourchette). Seuls les régimes
+        // franchement haussiers (bull/uptrend) bloquent encore le short.
         const regimeRow = await this.prisma.market_regime.findFirst({
           where: { token }, orderBy: { recorded_at: 'desc' },
         }).catch(() => null);
-        const isBearRegime = regimeRow?.regime?.toLowerCase() === 'bear'
-          || regimeRow?.regime?.toLowerCase() === 'downtrend';
-        if (isBearRegime) {
+        const reg = regimeRow?.regime?.toLowerCase() || 'inconnu';
+        const isBullRegime = reg === 'bull' || reg === 'uptrend';
+        const shortAllowedByRegime = !isBullRegime; // bear, downtrend, range, high_vol, low_vol, inconnu → autorisé
+        // Traçabilité : log systématique de l'évaluation du short momentum.
+        this.logger.log(
+          `[SHORT-EVAL] Momentum ${token} : signal sell + 0 long ouvert, régime « ${reg} » → ` +
+          `${shortAllowedByRegime ? 'SHORT AUTORISÉ' : 'bloqué (régime haussier)'}`,
+        );
+        if (shortAllowedByRegime) {
           const shortRes = await this.gmx.openShortForStrategy({
             source: 'momentum',
             indexToken: token,
             entryPrice: snap.latestPrice,
-            reasonNote: `signal sell + régime ${regimeRow?.regime}`,
+            reasonNote: `signal sell + régime ${reg}`,
           });
-          results.push({ token, action: 'short_signal', short: shortRes });
+          results.push({ token, action: 'short_signal', regime: reg, short: shortRes });
         } else {
-          results.push({ token, action: 'skip_short', reason: 'regime_non_bear', regime: regimeRow?.regime || 'inconnu' });
+          results.push({ token, action: 'skip_short', reason: 'regime_haussier', regime: reg });
         }
       }
     }

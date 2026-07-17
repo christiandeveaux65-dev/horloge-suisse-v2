@@ -7,6 +7,7 @@ import { PriceService } from '../price/price.service';
 import { rsi, bollingerBands } from '../indicators';
 import {
   CHAIN, MAX_TRADE_SIZE_MR, MAX_EXPOSURE_PER_TOKEN, MAX_TOTAL_EXPOSURE_MR, MR_ALLOWED_TOKENS,
+  SHORT_RSI_THRESHOLD, SHORT_ALLOWED_TOKENS,
 } from '../constants';
 import { getStrategyModulation } from '../common/strategy-modulation';
 import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
@@ -161,16 +162,27 @@ export class MeanReversionService implements OnModuleInit {
 
     // Signal d'entrée : RSI < oversold ET prix sous bande inférieure
     const longSignal = bands && currentPrice < bands.lower && rsiVal <= cfg.rsi_oversold;
-    // Phase 2 : signal SHORT symétrique — prix AU-DESSUS de la bande supérieure ET RSI
-    // au-dessus du seuil overbought. Ouvre un SHORT sur GMX Perps au lieu d'ignorer.
-    const shortSignal = bands && currentPrice > bands.upper && rsiVal >= cfg.rsi_overbought;
+    // Phase 3 : signal SHORT assoupli — « touch » de la bande supérieure (>=, au lieu d'un
+    // breakout strict >) ET RSI >= SHORT_RSI_THRESHOLD (65, au lieu de rsi_overbought=75).
+    // Le seuil retenu = min(rsi_overbought, 65) pour que les shorts se déclenchent enfin.
+    const shortRsiThreshold = Math.min(cfg.rsi_overbought, SHORT_RSI_THRESHOLD);
+    const shortEligibleToken = SHORT_ALLOWED_TOKENS.includes(token);
+    const shortSignal = !!bands && currentPrice >= bands.upper && rsiVal >= shortRsiThreshold;
+    // Traçabilité : on logge l'évaluation des conditions SHORT à CHAQUE cycle (même refus).
+    if (bands && shortEligibleToken) {
+      this.logger.log(
+        `[SHORT-EVAL] MR ${token} : prix $${currentPrice.toFixed(4)} vs BB upper $${bands.upper.toFixed(4)} ` +
+        `(${currentPrice >= bands.upper ? 'TOUCHÉ' : 'sous'}), RSI ${rsiVal.toFixed(1)} vs seuil ${shortRsiThreshold} ` +
+        `(${rsiVal >= shortRsiThreshold ? 'OK' : 'insuffisant'}) → ${shortSignal ? 'SIGNAL SHORT' : 'pas de short'}`,
+      );
+    }
 
-    if (shortSignal && couplingMult > 0) {
+    if (shortSignal && shortEligibleToken && couplingMult > 0) {
       const shortRes = await this.gmx.openShortForStrategy({
         source: 'mean_reversion',
         indexToken: token,
         entryPrice: currentPrice,
-        reasonNote: `RSI ${rsiVal.toFixed(1)} > ${cfg.rsi_overbought} + prix > BB upper $${bands.upper.toFixed(4)}`,
+        reasonNote: `RSI ${rsiVal.toFixed(1)} ≥ ${shortRsiThreshold} + prix ≥ BB upper $${bands.upper.toFixed(4)}`,
       });
       return { token, action: 'short_signal', rsi: rsiVal, price: currentPrice, short: shortRes };
     }

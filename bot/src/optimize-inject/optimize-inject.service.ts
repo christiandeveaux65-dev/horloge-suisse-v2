@@ -278,4 +278,126 @@ export class OptimizeInjectService {
       rolled_back_at: ts,
     };
   }
+
+  /**
+   * Capital total estimé (USD) à partir du dernier lot de snapshots portefeuille.
+   * Repli sur $7800 si aucun snapshot n'est disponible.
+   */
+  private async estimateTotalCapitalUsd(): Promise<number> {
+    try {
+      const latest = await (this.prisma as any).portfolio_snapshot.findFirst({
+        orderBy: { snapshot_at: 'desc' },
+        select: { snapshot_at: true },
+      });
+      if (latest?.snapshot_at) {
+        // Fenêtre de 2 min autour du dernier snapshot pour capter tout le lot.
+        const from = new Date(new Date(latest.snapshot_at).getTime() - 120000);
+        const rows = await (this.prisma as any).portfolio_snapshot.findMany({
+          where: { snapshot_at: { gte: from } },
+        });
+        const total = rows.reduce((s: number, r: any) => s + (parseFloat(r.value_usd) || 0), 0);
+        if (total > 0) return total;
+      }
+    } catch {
+      /* snapshots indisponibles : repli */
+    }
+    return 7800;
+  }
+
+  /**
+   * FIX 1 — Reconnexion « cerveau → bras ».
+   *
+   * Lit les directives du Strategy Evaluator (table strategy_directive) et les APPLIQUE
+   * réellement aux configs des modules traders :
+   *   - active/inactif  → bascule le flag `paused` de la config du module
+   *                       (paused=true coupe totalement le module au prochain cycle),
+   *   - allocation %    → ajuste `budget_usd` = allocation_pct/100 × capital total
+   *                       (pour grid / mean_reversion ; momentum réparti au prorata ;
+   *                        dca et arbitrage : bascule paused uniquement).
+   *
+   * Chaque changement effectif est journalisé « [DIRECTIVE APPLIQUÉE] … ».
+   * Idempotent : n'écrit en base que si l'état diffère de la directive.
+   */
+  async applyEvaluatorDirectives(): Promise<any> {
+    const directives = await (this.prisma as any).strategy_directive.findMany();
+    if (!directives || directives.length === 0) {
+      this.logger.warn('[DIRECTIVE] Aucune directive du Strategy Evaluator à appliquer (table vide).');
+      return { applied: [], skipped: [], totalCapitalUsd: 0 };
+    }
+    const totalCapitalUsd = await this.estimateTotalCapitalUsd();
+    const byName = new Map<string, any>(directives.map((d: any) => [d.strategy, d]));
+
+    const applied: any[] = [];
+    const unchanged: string[] = [];
+
+    // Délégué + capacité budget par stratégie pilotée.
+    const targets: { name: string; delegate: any; hasBudget: boolean; multi?: boolean }[] = [
+      { name: 'grid',           delegate: (this.prisma as any).grid_config,           hasBudget: true },
+      { name: 'mean_reversion', delegate: (this.prisma as any).mean_reversion_config, hasBudget: true },
+      { name: 'momentum',       delegate: (this.prisma as any).momentum_config,       hasBudget: true, multi: true },
+      { name: 'dca',            delegate: (this.prisma as any).strategy,              hasBudget: false },
+      { name: 'arbitrage',      delegate: (this.prisma as any).arbitrage_config,      hasBudget: false },
+    ];
+
+    for (const t of targets) {
+      const dir = byName.get(t.name);
+      if (!dir) { unchanged.push(`${t.name}(pas de directive)`); continue; }
+      const desiredPaused = !dir.recommended_active;
+      const allocUsd = Math.round((dir.recommended_allocation_pct / 100) * totalCapitalUsd);
+
+      try {
+        const rows = await t.delegate.findMany({ where: { active: true } });
+        if (!rows || rows.length === 0) { unchanged.push(`${t.name}(pas de config active)`); continue; }
+
+        // Répartition du budget : configs mono = budget total ; multi = au prorata de
+        // l'ancien budget_usd (préserve la ventilation interne, ex. momentum alts vs blue-chips).
+        const oldBudgetSum = t.hasBudget
+          ? rows.reduce((s: number, r: any) => s + (parseFloat(r.budget_usd) || 0), 0)
+          : 0;
+
+        for (const cfg of rows) {
+          const data: any = {};
+          let changeParts: string[] = [];
+
+          if (cfg.paused !== desiredPaused) {
+            data.paused = desiredPaused;
+            changeParts.push(`paused ${cfg.paused}→${desiredPaused}`);
+          }
+
+          if (t.hasBudget) {
+            let target = allocUsd;
+            if (t.multi && oldBudgetSum > 0) {
+              const share = (parseFloat(cfg.budget_usd) || 0) / oldBudgetSum;
+              target = Math.round(allocUsd * share);
+            }
+            const current = Math.round(parseFloat(cfg.budget_usd) || 0);
+            // Seuil de 1 % pour éviter des écritures pour des variations négligeables.
+            if (target > 0 && Math.abs(target - current) > Math.max(1, current * 0.01)) {
+              data.budget_usd = String(target);
+              changeParts.push(`budget $${current}→$${target}`);
+            }
+          }
+
+          if (Object.keys(data).length > 0) {
+            await t.delegate.update({ where: { id: cfg.id }, data });
+            const msg = `[DIRECTIVE APPLIQUÉE] ${t.name}${t.multi ? ` (${cfg.name})` : ''}: ` +
+              `active=${dir.recommended_active} alloc=${dir.recommended_allocation_pct.toFixed(1)}% ` +
+              `(score ${dir.score.toFixed(2)}, régime ${dir.regime}) — ${changeParts.join(', ')}`;
+            this.logger.log(msg);
+            applied.push({ strategy: t.name, configId: cfg.id, changes: changeParts, reason: dir.reason });
+          } else {
+            unchanged.push(`${t.name}(déjà conforme)`);
+          }
+        }
+      } catch (e: any) {
+        this.logger.error(`[DIRECTIVE] Échec application ${t.name}: ${e.message}`);
+      }
+    }
+
+    this.logger.log(
+      `[DIRECTIVE] Application terminée : ${applied.length} changement(s), ` +
+      `${unchanged.length} inchangé(s), capital estimé $${totalCapitalUsd.toFixed(0)}.`,
+    );
+    return { applied, unchanged, totalCapitalUsd };
+  }
 }

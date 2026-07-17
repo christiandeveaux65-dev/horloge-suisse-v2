@@ -4,7 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
-import { GRID_BUDGET_USD, GRID_LEVELS, GRID_PER_LEVEL_USD, SHORT_ALLOWED_TOKENS } from '../constants';
+import { GRID_BUDGET_USD, GRID_LEVELS, GRID_PER_LEVEL_USD, GRID_DEFAULT_RANGE_PCT, GRID_MAX_MARGIN_PCT, GRID_TARGET_STEP_PCT, SHORT_ALLOWED_TOKENS } from '../constants';
 import { GmxService } from '../gmx/gmx.service';
 import { getStrategyModulation } from '../common/strategy-modulation';
 import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
@@ -86,7 +86,7 @@ export class GridService {
     const cfgRange = Number(cfg.range_pct);
     const rangePct = Number.isFinite(cfgRange) && cfgRange > 0
       ? Math.max(1, Math.min(10, cfgRange))
-      : 3.5;
+      : GRID_DEFAULT_RANGE_PCT;
     let lower = parseFloat(cfg.price_lower);
     let upper = parseFloat(cfg.price_upper);
 
@@ -112,7 +112,22 @@ export class GridService {
       });
     }
 
-    const levels = cfg.grid_levels || GRID_LEVELS;
+    // FIX 4 — Resserrement automatique : les configs héritées avaient des pas trop larges
+    // (ex. range ±10 % / 4 niveaux → pas 5 %) qui ne se déclenchaient que sur de gros
+    // mouvements → grille quasi inactive. On vise un pas ≈ GRID_TARGET_STEP_PCT (~2 %),
+    // au-dessus du breakeven (~1.5 %) mais assez serré pour trader souvent. Si le pas natif
+    // dépasse largement la cible, on augmente le nombre EFFECTIF de niveaux (borné à 30).
+    const baseLevels = cfg.grid_levels || GRID_LEVELS;
+    const widthPct = currentPrice > 0 ? ((upper - lower) / currentPrice) * 100 : 0;
+    const nativeStepPct = baseLevels > 0 ? widthPct / baseLevels : 0;
+    let levels = baseLevels;
+    if (nativeStepPct > GRID_TARGET_STEP_PCT * 1.3 && widthPct > 0) {
+      levels = Math.min(30, Math.max(baseLevels, Math.ceil(widthPct / GRID_TARGET_STEP_PCT)));
+      this.logger.log(
+        `[GRID-EVAL] ${token} resserrement : pas natif ${nativeStepPct.toFixed(2)}% → ` +
+        `${levels} niveaux effectifs (pas cible ~${GRID_TARGET_STEP_PCT}%, largeur ${widthPct.toFixed(1)}%)`,
+      );
+    }
     const step = (upper - lower) / levels;
     if (step <= 0) return { success: false, reason: 'fourchette_invalide' };
 
@@ -139,12 +154,19 @@ export class GridService {
     // Si l'écart entre deux niveaux ne couvre pas le coût de l'aller-retour DEX + marge,
     // les NOUVEAUX achats sont refusés (les ventes de liquidation restent autorisées).
     const stepPct = currentPrice > 0 ? (step / currentPrice) * 100 : 0;
-    const minPP = await getMinProfitPct(this.prisma, 'grid');
+    // Grille = stratégie haute fréquence à petite marge : on plafonne la marge de profit
+    // à GRID_MAX_MARGIN_PCT pour que des pas ~1.5 % restent éligibles (sinon le breakeven
+    // ~2.1 % refuse tout et la grille reste inactive).
+    const minPP = Math.min(await getMinProfitPct(this.prisma, 'grid'), GRID_MAX_MARGIN_PCT);
     const est = estimateRoundTripCost(perLevelUsd, minPP);
     const gridProfitable = passesProfitability(stepPct, est);
     if (!gridProfitable) {
       this.logger.log(
-        `[RENTABILITÉ] Grid ${token} achats REFUSÉS : pas de grille ${stepPct.toFixed(2)}% < seuil ${est.breakevenPct.toFixed(2)}% (coût ${est.costPct.toFixed(2)}% + marge ${minPP.toFixed(2)}%)`,
+        `[RENTABILITÉ] Grid ${token} achats REFUSÉS : pas de grille ${stepPct.toFixed(2)}% < seuil ${est.breakevenPct.toFixed(2)}% (coût ${est.costPct.toFixed(2)}% + marge ${minPP.toFixed(2)}%) — niveaux=${levels}, range=±${rangePct}%`,
+      );
+    } else {
+      this.logger.log(
+        `[GRID-EVAL] ${token} pas ${stepPct.toFixed(2)}% ≥ breakeven ${est.breakevenPct.toFixed(2)}% — grille ACTIVE (niveaux=${levels}, range=±${rangePct}%, prix $${currentPrice.toFixed(4)}, bas $${lower.toFixed(4)}, haut $${upper.toFixed(4)})`,
       );
     }
 

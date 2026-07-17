@@ -61,6 +61,17 @@ export class OptimizeInjectController {
     );
   }
 
+  @Post('apply-directives')
+  @ApiOperation({
+    summary: 'FIX 1 — Applique les directives du Strategy Evaluator aux configs des modules',
+    description: 'Lit la table strategy_directive et bascule active/paused + budget_usd des modules '
+      + '(grid, mean_reversion, momentum, dca, arbitrage). Idempotent : n\'écrit que si l\'état diffère. '
+      + 'Exécuté automatiquement à chaque cycle du pipeline (Phase 5ter).',
+  })
+  async applyDirectives(): Promise<any> {
+    return this.svc.applyEvaluatorDirectives();
+  }
+
   @Get('injection-history')
   @ApiOperation({ summary: 'Historique des injections de paramètres (date, anciens/nouveaux params, wfe...)' })
   @ApiQuery({ name: 'limit', required: false })

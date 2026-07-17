@@ -199,6 +199,12 @@ export class PipelineOrchestrator {
       // ─── Phase 5bis ÉVALUATION — scoring des stratégies (entre supervision et strategist) ───
       await run('strategy_evaluator', 'Phase 5bis ÉVALUATION', () => this.strategyEvaluator.tick());
 
+      // ─── Phase 5ter DIRECTIVES — FIX 1 : reconnexion « cerveau → bras » ───
+      // Applique RÉELLEMENT les directives du Strategy Evaluator aux configs des modules
+      // (active/paused + budget_usd). Exécutée à CHAQUE cycle (et non plus reléguée à
+      // l'auto-réoptimisation horaire) pour que les bras suivent le cerveau sans délai.
+      await run('apply_directives', 'Phase 5ter DIRECTIVES', () => this.optimizeInject.applyEvaluatorDirectives());
+
       // ─── Phase 5 STRATÉGIE ───
       await run('strategist', 'Phase 5 STRATÉGIE', () => this.strategist.tick());
 
