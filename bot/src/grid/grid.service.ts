@@ -16,10 +16,18 @@ import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../
  * Budget hardcodé : $1000 total, $100/niveau (constants.ts).
  * Cron toutes les 3 minutes.
  */
+// ─── KILL-SWITCH GRID (URGENCE juillet 2026) ─────────────────────────────────
+// Le module Grid est DÉSACTIVÉ EN DUR à la demande de l'opérateur : malgré les
+// garde-fous (budget strict, cooldown, max positions), des achats continuaient à
+// hémorrager du USDC (43 buys / 6 sells). Tant que ce drapeau est à true, le Grid
+// ne place AUCUN trade (ni achat ni vente ni short overlay). Ne pas remettre à false
+// sans instruction explicite de l'opérateur.
+const GRID_KILL_SWITCH = true;
+
 @Injectable()
 export class GridService {
   private readonly logger = new Logger(GridService.name);
-  private enabled = true;
+  private enabled = !GRID_KILL_SWITCH;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -33,6 +41,7 @@ export class GridService {
 
   /** Appelé séquentiellement par le PipelineOrchestrator (plus de @Cron individuel). */
   async tick(): Promise<any> {
+    if (GRID_KILL_SWITCH) return { skipped: true, reason: 'kill_switch_grid_desactive' };
     if (!this.enabled) return { skipped: true, reason: 'disabled' };
     try {
       return await this.executeCycle();
@@ -64,6 +73,11 @@ export class GridService {
   }
 
   async executeCycle(): Promise<any> {
+    // KILL-SWITCH : garde-fou ultime — aucun trade grid tant qu'il est actif.
+    if (GRID_KILL_SWITCH) {
+      this.logger.warn('[GRID] Kill-switch actif — module Grid désactivé, aucun trade exécuté.');
+      return { success: false, reason: 'kill_switch_grid_desactive' };
+    }
     const riskCfg = await this.prisma.risk_config.findFirst();
     if (riskCfg?.global_paused) {
       return { success: false, reason: 'pause_globale' };
