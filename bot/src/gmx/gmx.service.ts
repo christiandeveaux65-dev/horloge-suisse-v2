@@ -9,7 +9,10 @@ import {
   GMX_BUDGET_USD, GMX_TARGET_LEVERAGE, GMX_MAX_LEVERAGE,
   GMX_STOP_LOSS_PCT, GMX_COLLATERAL_USD, GMX_WETH_USD_MARKET,
   GMX_TAKE_PROFIT_LEVELS, GMX_FUNDING_LONG_THRESHOLD, GMX_FUNDING_SHORT_THRESHOLD,
+  SHORT_ALLOWED_TOKENS, SHORT_COLLATERAL_USD, SHORT_LEVERAGE, SHORT_MAX_POSITIONS,
+  SHORT_MAX_SIZE_USD,
 } from '../constants';
+import { computeAtrStops } from '../common/dynamic-stops';
 
 /**
  * GMX V2 — Longs à levier modéré (2x, max 5x) sur WETH.
@@ -280,8 +283,11 @@ export class GmxService {
       const leverage = parseFloat(pos.leverage) || GMX_TARGET_LEVERAGE;
       const collateral = parseFloat(pos.collateral_usd) || GMX_COLLATERAL_USD;
 
-      // PnL sur le collatéral = variation prix × levier (long).
-      const priceChangePct = ((price - entry) / entry) * 100;
+      // PnL sur le collatéral = variation prix × levier.
+      // Pour un SHORT, le PnL est inversé (baisse du prix = gain).
+      const isLong = pos.is_long !== false;
+      const rawChangePct = ((price - entry) / entry) * 100;
+      const priceChangePct = isLong ? rawChangePct : -rawChangePct;
       const collateralPnlPct = priceChangePct * leverage;
 
       // Trailing : mettre à jour le plus haut.
@@ -295,6 +301,32 @@ export class GmxService {
       // Stop-loss dur : perte du collatéral >= stop_loss_pct.
       if (collateralPnlPct <= -cfg.stop_loss_pct) {
         results.push(await this.closePosition(pos, price, 'stop_loss', collateralPnlPct));
+        continue;
+      }
+
+      // ── SHORT : gestion simplifiée par stops ATR dynamiques (Phase 2). ──
+      // Pour les shorts, on ignore le TP échelonné/trailing (conçus pour longs)
+      // et on utilise exclusivement les stops ATR : SL au-dessus de l'entrée,
+      // TP en-dessous (ratio 2:1 identique à la Phase 1).
+      if (!isLong) {
+        const shortPrices = await this.priceService.getPriceSeries(pos.index_token, 100).catch(() => [] as number[]);
+        const atrStops = computeAtrStops(shortPrices, entry);
+        if (atrStops) {
+          const atrShortSL = entry * (1 + atrStops.stopPct / 100);
+          const atrShortTP = entry * (1 - atrStops.takePct / 100);
+          if (price >= atrShortSL) {
+            results.push(await this.closePosition(pos, price, 'stop_loss_atr_short', collateralPnlPct));
+            continue;
+          }
+          if (price <= atrShortTP) {
+            results.push(await this.closePosition(pos, price, 'take_profit_atr_short', collateralPnlPct));
+            continue;
+          }
+        }
+        results.push({
+          id: pos.id, action: 'hold_short', price, entry, leverage,
+          collateralPnlPct: Number(collateralPnlPct.toFixed(2)),
+        });
         continue;
       }
 
@@ -397,10 +429,14 @@ export class GmxService {
     const realized = (collateral * pnlPct) / 100;
     const isDryRun = this.blockchain.getIsDryRun();
 
-    // ── Appel on-chain GMX (MarketDecrease). Pour fermer un long, on accepte de
-    //    vendre jusqu'à un prix plancher (price × (1 - slippage)). ──
+    // ── Appel on-chain GMX (MarketDecrease). Pour fermer un long on accepte un
+    //    prix plancher (price × (1 - slippage)) ; pour un short on accepte un
+    //    prix plafond (price × (1 + slippage)). ──
     const slippageBps = pos.slippage_bps ?? 100;
-    const acceptablePrice = price * (1 - slippageBps / 10000);
+    const posIsLong = pos.is_long !== false;
+    const acceptablePrice = posIsLong
+      ? price * (1 - slippageBps / 10000)
+      : price * (1 + slippageBps / 10000);
     const chain = await this.blockchain.gmxCloseLong({
       market: pos.market || GMX_WETH_USD_MARKET,
       collateralTokenSymbol: pos.collateral_token || 'USDC',
@@ -408,7 +444,7 @@ export class GmxService {
       sizeDeltaUsd: sizeUsd,
       acceptablePrice,
       indexTokenSymbol: pos.index_token || 'WETH',
-      isLong: pos.is_long ?? true,
+      isLong: posIsLong,
     });
 
     // Si l'appel live échoue (hors dry-run), on NE clôt PAS la position en base
@@ -556,6 +592,118 @@ export class GmxService {
       stopLossPct: GMX_STOP_LOSS_PCT,
       note: 'Ouvertures en pause par défaut. Exécution perp câblée sur GMX V2 (ExchangeRouter multicall) ; live requiert WALLET_PRIVATE_KEY, sinon simulé.',
       config: cfg ? { ...cfg, positions: undefined, openPositions: cfg.positions?.length ?? 0 } : null,
+    };
+  }
+
+  /**
+   * Phase 2 — Ouverture SHORT via GMX Perps, appelée par MR/Momentum/Grid.
+   * - Levier fixe SHORT_LEVERAGE (2×), collatéral SHORT_COLLATERAL_USD ($50).
+   * - Taille bornée par SHORT_MAX_SIZE_USD ; refuse si SHORT_MAX_POSITIONS atteint.
+   * - Uniquement WETH/WBTC/ARB (SHORT_ALLOWED_TOKENS).
+   * - Les stops ATR sont appliqués automatiquement par managePositions.
+   */
+  async openShortForStrategy(params: {
+    source: string;         // 'mean_reversion' | 'momentum' | 'grid'
+    indexToken: string;     // WETH / WBTC / ARB
+    entryPrice: number;     // prix courant utilisé comme reference
+    reasonNote?: string;    // texte log (ex: "RSI overbought + BB upper")
+  }): Promise<any> {
+    const token = params.indexToken.toUpperCase();
+    if (!SHORT_ALLOWED_TOKENS.includes(token)) {
+      return { action: 'skip', reason: 'token_non_autorise_short', token };
+    }
+    if (!params.entryPrice || params.entryPrice <= 0) {
+      return { action: 'skip', reason: 'prix_invalide' };
+    }
+
+    // Cap sur le nombre de SHORTs ouverts (toutes sources confondues).
+    const openShorts = await this.prisma.gmx_position.count({
+      where: { is_long: false, status: { in: ['open', 'pending_open', 'simulated'] } },
+    });
+    if (openShorts >= SHORT_MAX_POSITIONS) {
+      return { action: 'skip', reason: 'max_shorts_atteint', openShorts };
+    }
+
+    // Config GMX (utilise le même budget que les longs).
+    let cfg = await this.prisma.gmx_config.findFirst();
+    if (!cfg) {
+      return { action: 'skip', reason: 'gmx_config_absente' };
+    }
+    const deployed = parseFloat(cfg.deployed_usd) || 0;
+    const budget = Math.min(parseFloat(cfg.budget_usd), GMX_BUDGET_USD);
+    if (deployed + SHORT_COLLATERAL_USD > budget) {
+      return { action: 'skip', reason: 'budget_gmx_epuise', deployed, budget };
+    }
+
+    const collateral = SHORT_COLLATERAL_USD;
+    const leverage = SHORT_LEVERAGE;
+    const sizeUsd = Math.min(collateral * leverage, SHORT_MAX_SIZE_USD);
+
+    // SHORT : on accepte de vendre jusqu'à un prix plancher (glissement borné).
+    const slippageBps = Number(cfg.slippage_bps) || 30;
+    const acceptablePrice = params.entryPrice * (1 - slippageBps / 10000);
+
+    const chain = await this.blockchain.gmxOpenLong({
+      market: GMX_WETH_USD_MARKET,
+      collateralTokenSymbol: cfg.collateral_token || 'USDC',
+      collateralAmountUsd: collateral,
+      sizeDeltaUsd: sizeUsd,
+      acceptablePrice,
+      indexTokenSymbol: token,
+      isLong: false,
+    });
+
+    if (!chain.simulated && !chain.success) {
+      this.logger.error(`GMX SHORT ouverture on-chain échouée ${token} (${params.source}) : ${chain.error}`);
+      await this.prisma.leverage_event.create({
+        data: {
+          protocol: 'gmx', kind: 'error',
+          detail: `SHORT ouverture échouée ${token}`,
+          payload: JSON.stringify({ source: params.source, collateral, leverage, sizeUsd, error: chain.error }),
+        },
+      }).catch(() => undefined);
+      return { action: 'open_failed', reason: 'chain_error', error: chain.error };
+    }
+
+    const pos = await this.prisma.gmx_position.create({
+      data: {
+        config_id: cfg.id,
+        market: GMX_WETH_USD_MARKET,
+        index_token: token,
+        collateral_token: cfg.collateral_token || 'USDC',
+        is_long: false,
+        collateral_usd: collateral.toFixed(2),
+        size_usd: sizeUsd.toFixed(2),
+        leverage: leverage.toString(),
+        entry_price: params.entryPrice.toString(),
+        highest_price: params.entryPrice.toString(),
+        status: chain.simulated ? 'simulated' : 'pending_open',
+        open_tx_hash: chain.txHash,
+        open_order_key: chain.orderKey || undefined,
+      },
+    });
+    await this.prisma.gmx_config.update({
+      where: { id: cfg.id },
+      data: { deployed_usd: (deployed + collateral).toFixed(2) },
+    });
+    await this.prisma.leverage_event.create({
+      data: {
+        protocol: 'gmx', kind: 'open',
+        detail: `SHORT ${token} depuis ${params.source} collat $${collateral} levier ${leverage}x`,
+        payload: JSON.stringify({
+          source: params.source, positionId: pos.id, collateral, leverage, sizeUsd,
+          entry: params.entryPrice, note: params.reasonNote || null,
+          txHash: chain.txHash, simulated: chain.simulated,
+        }),
+      },
+    }).catch(() => undefined);
+    this.logger.log(
+      `[SHORT] ${params.source} → GMX SHORT ${token} collat $${collateral} levier ${leverage}x (taille $${sizeUsd}) @ $${params.entryPrice} [${chain.simulated ? 'dry-run' : 'pending_open ' + chain.txHash.slice(0, 12)}]${params.reasonNote ? ' — ' + params.reasonNote : ''}`,
+    );
+    return {
+      action: 'short_open', positionId: pos.id, source: params.source,
+      token, collateral, leverage, sizeUsd,
+      entry: params.entryPrice, txHash: chain.txHash, simulated: chain.simulated,
     };
   }
 }

@@ -4,7 +4,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { acquireCronRun } from '../common/cron-lock';
 import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
-import { GRID_BUDGET_USD, GRID_LEVELS, GRID_PER_LEVEL_USD } from '../constants';
+import { GRID_BUDGET_USD, GRID_LEVELS, GRID_PER_LEVEL_USD, SHORT_ALLOWED_TOKENS } from '../constants';
+import { GmxService } from '../gmx/gmx.service';
 import { getStrategyModulation } from '../common/strategy-modulation';
 import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
 
@@ -24,6 +25,7 @@ export class GridService {
     private readonly prisma: PrismaService,
     private readonly tradeExecution: TradeExecutionService,
     private readonly priceService: PriceService,
+    private readonly gmx: GmxService,
   ) {}
 
   isEnabled(): boolean { return this.enabled; }
@@ -211,6 +213,37 @@ export class GridService {
           });
         }
         results.push({ action: 'sell', price: currentPrice, boughtAt: cheapest.price, trade });
+      }
+    }
+
+    // Phase 2 : overlay SHORT via GMX quand le prix atteint le HAUT de la fourchette.
+    // Symétrique de l'achat spot en bas de grille : au lieu de subir la poussée vers le
+    // haut, on ouvre un short pour capter un éventuel retour dans la fourchette.
+    // Une seule short overlay par cycle ; cappé par openShortForStrategy (max 3 globaux).
+    if (SHORT_ALLOWED_TOKENS.includes(token) && currentPrice >= upper && modulation.active) {
+      // Éviter les doublons : ne pas ouvrir un short si une short grid_overlay est déjà vivante.
+      const existingOverlay = await this.prisma.leverage_event.findFirst({
+        where: { protocol: 'gmx', kind: 'open', detail: { contains: 'SHORT ' + token + ' depuis grid' } },
+        orderBy: { created_at: 'desc' },
+      }).catch(() => null);
+      let overlayActive = false;
+      if (existingOverlay) {
+        try {
+          const p = JSON.parse(existingOverlay.payload);
+          if (p?.positionId) {
+            const pos = await this.prisma.gmx_position.findUnique({ where: { id: p.positionId } });
+            overlayActive = pos ? ['open', 'pending_open', 'simulated'].includes(pos.status) : false;
+          }
+        } catch {}
+      }
+      if (!overlayActive) {
+        const shortRes = await this.gmx.openShortForStrategy({
+          source: 'grid',
+          indexToken: token,
+          entryPrice: currentPrice,
+          reasonNote: `prix $${currentPrice.toFixed(4)} ≥ haut de grille $${upper.toFixed(4)}`,
+        });
+        results.push({ action: 'grid_short_overlay', price: currentPrice, upper, short: shortRes });
       }
     }
 

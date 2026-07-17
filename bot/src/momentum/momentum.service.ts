@@ -6,6 +6,9 @@ import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import { computeSignal, IndicatorSnapshot } from '../indicators';
+import { computeAtrStops } from '../common/dynamic-stops';
+import { GmxService } from '../gmx/gmx.service';
+import { SHORT_ALLOWED_TOKENS } from '../constants';
 import {
   CHAIN, MOMENTUM_ALTS_SIZE_USD, MOMENTUM_BC_SIZE_USD,
   TARGET_VOLATILITY, MOMENTUM_MIN_HOLD_MIN,
@@ -28,6 +31,7 @@ export class MomentumService implements OnModuleInit {
     private readonly tradeExecution: TradeExecutionService,
     private readonly priceService: PriceService,
     private readonly blockchain: BlockchainService,
+    private readonly gmx: GmxService,
   ) {}
 
   /**
@@ -288,7 +292,7 @@ export class MomentumService implements OnModuleInit {
       });
 
       for (const pos of openPositions) {
-        const result = await this.managePosition(cfg, pos, snap);
+        const result = await this.managePosition(cfg, pos, snap, prices);
         if (result) results.push(result);
       }
 
@@ -302,16 +306,44 @@ export class MomentumService implements OnModuleInit {
         const result = await this.tryOpenPosition(cfg, token, snap, riskCfg, couplingMult, prices);
         results.push(result);
       }
+
+      // Phase 2 : signal SHORT en régime BEAR (signal sell + aucun long ouvert).
+      // Le signal sell = MA courte < MA longue + RSI > overbought — tendance baissière.
+      // Ouvre un SHORT via GMX Perps pour capter la baisse.
+      if (snap.signal === 'sell' && snap.latestPrice && openPositions.length === 0
+          && SHORT_ALLOWED_TOKENS.includes(token) && couplingMult > 0) {
+        // Confirme le régime bear via la table market_regime (Strategy Evaluator).
+        const regimeRow = await this.prisma.market_regime.findFirst({
+          where: { token }, orderBy: { recorded_at: 'desc' },
+        }).catch(() => null);
+        const isBearRegime = regimeRow?.regime?.toLowerCase() === 'bear'
+          || regimeRow?.regime?.toLowerCase() === 'downtrend';
+        if (isBearRegime) {
+          const shortRes = await this.gmx.openShortForStrategy({
+            source: 'momentum',
+            indexToken: token,
+            entryPrice: snap.latestPrice,
+            reasonNote: `signal sell + régime ${regimeRow?.regime}`,
+          });
+          results.push({ token, action: 'short_signal', short: shortRes });
+        } else {
+          results.push({ token, action: 'skip_short', reason: 'regime_non_bear', regime: regimeRow?.regime || 'inconnu' });
+        }
+      }
     }
 
     return { configId: cfg.id, name: cfg.name, results };
   }
 
-  private async managePosition(cfg: any, pos: any, snap: IndicatorSnapshot): Promise<any> {
+  private async managePosition(cfg: any, pos: any, snap: IndicatorSnapshot, prices: number[] = []): Promise<any> {
     if (!snap.latestPrice) return null;
     const price = snap.latestPrice;
     const entry = parseFloat(pos.entry_price);
     const highest = Math.max(parseFloat(pos.highest_price), price);
+
+    // Stops dynamiques basés sur l'ATR (volatilité réelle). Repli sur les % fixes de la
+    // config si l'ATR n'est pas calculable (série trop courte).
+    const atrStops = computeAtrStops(prices, entry);
 
     // Mettre à jour le plus haut
     if (price > parseFloat(pos.highest_price)) {
@@ -329,10 +361,17 @@ export class MomentumService implements OnModuleInit {
 
     // Stop-loss HARD (depuis le prix d'entrée) : TOUJOURS actif, même pendant la
     // détention minimum — c'est la seule sortie autorisée avant le seuil.
-    const stopLossPct = cfg.stop_loss_pct;
-    const basicStop = entry * (1 - stopLossPct / 100);
+    // Stop dynamique ATR prioritaire (coupe les pertes tôt) ; sinon % fixe de la config.
+    const stopLossPct = atrStops ? atrStops.stopPct : cfg.stop_loss_pct;
+    const basicStop = atrStops ? atrStops.stopLoss : entry * (1 - stopLossPct / 100);
     if (price <= basicStop) {
-      return this.closePosition(cfg, pos, price, 'stop_loss');
+      return this.closePosition(cfg, pos, price, atrStops ? 'stop_loss_atr' : 'stop_loss');
+    }
+
+    // Take-profit dynamique ATR (laisse courir les gains, ratio 2:1). Sortie totale.
+    // Actif uniquement au-delà de la détention minimum.
+    if (atrStops && !withinMinHold && price >= atrStops.takeProfit) {
+      return this.closePosition(cfg, pos, price, 'take_profit_atr');
     }
 
     // Pendant la détention minimum : aucune autre sortie (ni trailing, ni signal

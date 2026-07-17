@@ -236,10 +236,51 @@ export const GRID_PER_LEVEL_USD = 100;
 // Ancien réglage agressif (50 bps, $500, cron 2 min) non rentable → refonte prudente :
 // spread min relevé à 100 bps (couvre largement gas + slippage), ticket réduit à $200,
 // cron ralenti à 5 min. Le net profit après gas est toujours vérifié avant exécution.
-export const ARB_MIN_SPREAD_BPS = 100;   // min 100 bps (1 %) — conservateur
+// Diagnostic 72h : gain/loss ratio arbitrage = 0.008 (catastrophique). Cause : le profit
+// estimé ne soustrayait que ~$0.30 de gas mais IGNORAIT les frais de swap + slippage
+// (~0.8 % du notionnel aller-retour). Résultat : les « gagnants » rapportaient ~$0.005
+// pendant que les perdants coûtaient ~$0.67. Refonte : seuil de spread relevé à 250 bps
+// et gating sur le profit NET réaliste (frais + slippage + gas) + marge, pour viser un
+// gain/loss ratio >= 1.5.
+export const ARB_MIN_SPREAD_BPS = 250;   // min 250 bps (2.5 %) — couvre friction + marge
 export const ARB_MAX_SPREAD_BPS = 500;   // rejet si > 500 bps (anomalie)
 export const ARB_MAX_TRADE_USD = 200;    // ticket réduit à $200
+// Profit NET minimum (après frais de pool + slippage + gas) requis pour exécuter :
+export const ARB_MIN_NET_PROFIT_USD = 1.5;   // gain net absolu minimum ($)
+export const ARB_MIN_NET_MARGIN_PCT = 1.5;   // gain net minimum en % du notionnel
 export const UNISWAP_POOL_FEES = [500, 3000, 10000]; // pools 0.05% / 0.3% / 1%
+
+// ─── Stops dynamiques basés sur l'ATR (Momentum, Mean Reversion, Arbitrage) ───
+// Objectif : couper les pertes tôt, laisser courir les gains. Le stop-loss et le
+// take-profit sont calculés sur la volatilité réelle (ATR) plutôt qu'en % fixe.
+// Ratio reward:risk asymétrique 2:1 (TP mult = 2 × SL mult).
+export const ATR_PERIOD = 14;          // fenêtre de calcul de l'ATR
+export const ATR_SL_MULT = 1.5;        // stop-loss = entrée − 1.5 × ATR
+export const ATR_TP_MULT = 3.0;        // take-profit = entrée + 3.0 × ATR
+export const ATR_MIN_STOP_PCT = 1.5;   // borne basse du stop (%) — évite un stop trop serré
+export const ATR_MAX_STOP_PCT = 12;    // borne haute du stop (%) — évite un stop trop lâche
+// Arbitrage : garde-fou de volatilité. En marché agité (ATR élevé), on exige une marge
+// nette proportionnellement plus grande (multiplicateur × ATR%) pour couvrir le risque
+// d'exécution/slippage — un « stop » préventif sur l'entrée.
+export const ATR_ARB_MARGIN_MULT = 1.0;
+
+// ─── Mean Reversion : restriction aux paires liquides ───
+// Le winrate MR était de 0% : les tokens illiquides (GMX, PENDLE, UNI…) génèrent
+// des faux signaux (spreads larges, prix instables, slippage élevé). On restreint
+// strictement le Mean Reversion aux paires majeures profondes et liquides.
+// Ce filtre est appliqué dans le code même si la config DB persiste d'anciens tokens.
+export const MR_ALLOWED_TOKENS = ['WETH', 'WBTC', 'ARB'];
+
+// ─── Phase 2 : Trading SHORT via GMX Perps ───
+// Les stratégies MR / Momentum / Grid peuvent ouvrir des positions SHORT sur GMX
+// quand le signal l'indique (prix > moyenne pour MR, régime bear pour Momentum,
+// prix > haut de fourchette pour Grid). Levier modéré, taille bornée.
+export const SHORT_ALLOWED_TOKENS = ['WETH', 'WBTC', 'ARB'];
+export const SHORT_MAX_SIZE_USD = 100;      // taille max par SHORT (notionnel = collat × levier)
+export const SHORT_COLLATERAL_USD = 50;     // collatéral USD par SHORT
+export const SHORT_LEVERAGE = 2;            // levier fixe 2× (modéré)
+export const SHORT_MAX_POSITIONS = 3;       // nombre max de SHORTs ouverts simultanés
+export const SHORT_MAX_DRAWDOWN_PCT = 5;    // stop drawdown max identique à la Phase 1
 
 // ─── Momentum budgets ───
 export const MOMENTUM_ALTS_BUDGET_USD = 2000;

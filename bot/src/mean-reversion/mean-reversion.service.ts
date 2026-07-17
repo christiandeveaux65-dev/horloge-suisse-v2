@@ -6,10 +6,12 @@ import { TradeExecutionService } from '../trade/trade-execution.service';
 import { PriceService } from '../price/price.service';
 import { rsi, bollingerBands } from '../indicators';
 import {
-  CHAIN, MAX_TRADE_SIZE_MR, MAX_EXPOSURE_PER_TOKEN, MAX_TOTAL_EXPOSURE_MR,
+  CHAIN, MAX_TRADE_SIZE_MR, MAX_EXPOSURE_PER_TOKEN, MAX_TOTAL_EXPOSURE_MR, MR_ALLOWED_TOKENS,
 } from '../constants';
 import { getStrategyModulation } from '../common/strategy-modulation';
 import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
+import { computeAtrStops } from '../common/dynamic-stops';
+import { GmxService } from '../gmx/gmx.service';
 
 /**
  * Mean Reversion — RSI(14) + Bollinger Bands
@@ -26,6 +28,7 @@ export class MeanReversionService implements OnModuleInit {
     private readonly prisma: PrismaService,
     private readonly tradeExecution: TradeExecutionService,
     private readonly priceService: PriceService,
+    private readonly gmx: GmxService,
   ) {}
 
   isEnabled(): boolean { return this.enabled; }
@@ -43,7 +46,7 @@ export class MeanReversionService implements OnModuleInit {
           data: {
             name: 'Mean Reversion Principal',
             chain: CHAIN,
-            tokens: 'ARB,PENDLE,GMX',
+            tokens: MR_ALLOWED_TOKENS.join(','),
             budget_usd: '1000',
             bb_period: 20,
             bb_std_dev: '2.5',
@@ -56,7 +59,7 @@ export class MeanReversionService implements OnModuleInit {
             paused: false,
           },
         });
-        this.logger.log('MR config créée : ARB/PENDLE/GMX, budget $1000, BB 20/2.5, RSI 25/75, SL 6%, TP 8%');
+        this.logger.log(`MR config créée : ${MR_ALLOWED_TOKENS.join('/')}, budget $1000, BB 20/2.5, RSI 25/75, SL 6%, TP 8%`);
       }
     } catch (err: any) {
       this.logger.error(`MR onModuleInit: ${err.message}`);
@@ -104,7 +107,14 @@ export class MeanReversionService implements OnModuleInit {
 
     const results: any[] = [];
     for (const cfg of configs) {
-      const tokens = cfg.tokens.split(',').map((t: string) => t.trim().toUpperCase());
+      const rawTokens = cfg.tokens.split(',').map((t: string) => t.trim().toUpperCase());
+      // Modif 3 : filtre dur — MR restreint aux paires liquides (WETH/WBTC/ARB),
+      // même si la config DB persiste d'anciens tokens illiquides (GMX/PENDLE/UNI…).
+      const tokens = rawTokens.filter((t: string) => MR_ALLOWED_TOKENS.includes(t));
+      const skipped = rawTokens.filter((t: string) => !MR_ALLOWED_TOKENS.includes(t));
+      if (skipped.length > 0) {
+        this.logger.log(`[LIQUIDITÉ] MR — tokens illiquides ignorés: ${skipped.join(', ')} (autorisés: ${MR_ALLOWED_TOKENS.join(', ')})`);
+      }
       for (const token of tokens) {
         try {
           const result = await this.processToken(cfg, token, riskCfg, couplingMult);
@@ -151,6 +161,19 @@ export class MeanReversionService implements OnModuleInit {
 
     // Signal d'entrée : RSI < oversold ET prix sous bande inférieure
     const longSignal = bands && currentPrice < bands.lower && rsiVal <= cfg.rsi_oversold;
+    // Phase 2 : signal SHORT symétrique — prix AU-DESSUS de la bande supérieure ET RSI
+    // au-dessus du seuil overbought. Ouvre un SHORT sur GMX Perps au lieu d'ignorer.
+    const shortSignal = bands && currentPrice > bands.upper && rsiVal >= cfg.rsi_overbought;
+
+    if (shortSignal && couplingMult > 0) {
+      const shortRes = await this.gmx.openShortForStrategy({
+        source: 'mean_reversion',
+        indexToken: token,
+        entryPrice: currentPrice,
+        reasonNote: `RSI ${rsiVal.toFixed(1)} > ${cfg.rsi_overbought} + prix > BB upper $${bands.upper.toFixed(4)}`,
+      });
+      return { token, action: 'short_signal', rsi: rsiVal, price: currentPrice, short: shortRes };
+    }
 
     if (!longSignal) {
       return { token, action: 'hold', rsi: rsiVal, price: currentPrice };
@@ -242,8 +265,20 @@ export class MeanReversionService implements OnModuleInit {
     });
 
     if (result.success) {
-      const stopLoss = currentPrice * (1 - cfg.stop_loss_pct / 100);
-      const takeProfit = currentPrice * (1 + cfg.take_profit_pct / 100);
+      // Stops dynamiques basés sur l'ATR (volatilité réelle) ; repli sur les % fixes de
+      // la config si l'ATR n'est pas calculable (série trop courte).
+      const atrStops = computeAtrStops(prices, currentPrice);
+      const stopLoss = atrStops
+        ? atrStops.stopLoss
+        : currentPrice * (1 - cfg.stop_loss_pct / 100);
+      const takeProfit = atrStops
+        ? atrStops.takeProfit
+        : currentPrice * (1 + cfg.take_profit_pct / 100);
+      if (atrStops) {
+        this.logger.log(
+          `MR ${token} : stops ATR — SL $${stopLoss.toFixed(6)} (-${atrStops.stopPct.toFixed(2)}%) / TP $${takeProfit.toFixed(6)} (+${atrStops.takePct.toFixed(2)}%) (ATR ${atrStops.atrPct.toFixed(2)}%)`,
+        );
+      }
 
       await this.prisma.mean_reversion_position.create({
         data: {

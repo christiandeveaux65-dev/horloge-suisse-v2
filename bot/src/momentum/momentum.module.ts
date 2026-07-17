@@ -3,9 +3,10 @@ import { MomentumService } from './momentum.service';
 import { TradeModule } from '../trade/trade.module';
 import { PriceModule } from '../price/price.module';
 import { BlockchainModule } from '../blockchain/blockchain.module';
+import { GmxModule } from '../gmx/gmx.module';
 
 @Module({
-  imports: [TradeModule, PriceModule, BlockchainModule],
+  imports: [TradeModule, PriceModule, BlockchainModule, GmxModule],
   providers: [MomentumService],
   exports: [MomentumService],
 })

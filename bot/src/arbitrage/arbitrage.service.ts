@@ -7,8 +7,11 @@ import { PriceService } from '../price/price.service';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import {
   ARB_MIN_SPREAD_BPS, ARB_MAX_SPREAD_BPS, ARB_MAX_TRADE_USD,
+  ARB_MIN_NET_PROFIT_USD, ARB_MIN_NET_MARGIN_PCT, ATR_ARB_MARGIN_MULT,
 } from '../constants';
 import { getStrategyModulation } from '../common/strategy-modulation';
+import { estimateRoundTripCost } from '../common/profitability';
+import { atrPct } from '../indicators';
 
 /**
  * Arbitrage DEX — détecte une divergence entre le prix exécutable on-chain (quote Uniswap)
@@ -176,8 +179,11 @@ export class ArbitrageService implements OnModuleInit {
     const spreadBps = Math.round(((dexPrice - refPrice) / refPrice) * 10000);
     const absSpread = Math.abs(spreadBps);
 
-    if (absSpread < ARB_MIN_SPREAD_BPS) {
-      return { token, action: 'skip', reason: 'spread_insuffisant', spreadBps };
+    // Seuil de spread effectif : plancher dur ARB_MIN_SPREAD_BPS (250 bps) même si une
+    // ancienne config persistée en DB porte une valeur plus basse (100 bps).
+    const effMinSpread = Math.max(Number(cfg.min_spread_bps) || 0, ARB_MIN_SPREAD_BPS);
+    if (absSpread < effMinSpread) {
+      return { token, action: 'skip', reason: 'spread_insuffisant', spreadBps, effMinSpread };
     }
     if (absSpread > ARB_MAX_SPREAD_BPS) {
       this.logger.warn(`⚠️ Spread anormal ${token}: ${spreadBps} bps — rejet (anomalie)`);
@@ -201,13 +207,36 @@ export class ArbitrageService implements OnModuleInit {
       },
     });
 
-    // Estimation coût gas Arbitrum (2 swaps buy+sell)
-    const gasCostUsd = 0.30;
+    // Coût RÉALISTE de l'aller-retour : frais de pool (0.3 %) + slippage (0.1 %) sur
+    // CHAQUE jambe (achat + vente) + gas des 2 swaps. L'ancien calcul ne retirait que le
+    // gas ($0.30) et surestimait donc massivement le profit (cause du ratio 0.008).
+    const rtCost = estimateRoundTripCost(tradeUsd, 0);
+    const gasCostUsd = rtCost.costUsd; // friction + gas, tout compris
     const netProfit = profitEstimate - gasCostUsd;
-    if (netProfit <= 0) {
-      this.logger.log(`Arbitrage ${token}: spread ${absSpread} bps mais profit net $${netProfit.toFixed(2)} <= 0 (gas $${gasCostUsd}) — skip`);
+    const netMarginPct = tradeUsd > 0 ? (netProfit / tradeUsd) * 100 : 0;
+
+    // Garde-fou ATR (volatilité réelle) : en marché agité, on exige une marge nette
+    // proportionnellement plus grande pour couvrir le risque d'exécution/slippage.
+    // Seuil de marge dynamique = max(seuil fixe, ATR% × multiplicateur).
+    let series: number[] = [];
+    try {
+      series = await this.priceService.getPriceSeries(token, 100);
+    } catch {
+      /* série indisponible : on retombe sur le seuil fixe */
+    }
+    const tokenAtrPct = atrPct(series) ?? 0;
+    const dynMarginPct = Math.max(ARB_MIN_NET_MARGIN_PCT, tokenAtrPct * ATR_ARB_MARGIN_MULT);
+
+    // Double gate : profit net absolu ET marge nette dynamique (ATR) doivent être atteints,
+    // pour viser un gain/loss ratio >= 1.5 (ne garder que les vraies occasions).
+    if (netProfit < ARB_MIN_NET_PROFIT_USD || netMarginPct < dynMarginPct) {
+      this.logger.log(
+        `[RENTABILITÉ] Arbitrage ${token} REFUSÉ : spread ${absSpread} bps, profit brut $${profitEstimate.toFixed(2)} ` +
+        `- coût $${gasCostUsd.toFixed(2)} (frais+slippage+gas) = net $${netProfit.toFixed(2)} (${netMarginPct.toFixed(2)}%) ` +
+        `< seuils min $${ARB_MIN_NET_PROFIT_USD} / ${dynMarginPct.toFixed(2)}% (ATR ${tokenAtrPct.toFixed(2)}%)`,
+      );
       await this.prisma.arbitrage_opportunity.update({ where: { id: opp.id }, data: { status: 'expired' } });
-      return { token, action: 'skip', reason: 'profit_net_negatif', spreadBps, profitEstimate, gasCostUsd, netProfit };
+      return { token, action: 'skip', reason: 'profit_net_insuffisant', spreadBps, profitEstimate, gasCostUsd, netProfit, netMarginPct: Number(netMarginPct.toFixed(2)), dynMarginPct: Number(dynMarginPct.toFixed(2)), atrPct: Number(tokenAtrPct.toFixed(2)) };
     }
 
     // On n'exécute que le cas où le token est sous-évalué sur le DEX (achat spot possible).
@@ -260,6 +289,12 @@ export class ArbitrageService implements OnModuleInit {
       minSpreadBps: ARB_MIN_SPREAD_BPS,
       maxSpreadBps: ARB_MAX_SPREAD_BPS,
       maxTradeUsd: ARB_MAX_TRADE_USD,
+      profitability: {
+        min_net_profit_usd: ARB_MIN_NET_PROFIT_USD,
+        min_net_margin_pct: ARB_MIN_NET_MARGIN_PCT,
+        round_trip_cost_pct_estimate: Number(estimateRoundTripCost(ARB_MAX_TRADE_USD, 0).costPct.toFixed(3)),
+        note: "Un arbitrage n'est exécuté que si le profit NET (après frais de pool + slippage + gas) dépasse le seuil absolu ET la marge minimale, pour viser un gain/loss ratio >= 1.5.",
+      },
       config: cfg,
       recentOpportunities: recent,
     };

@@ -59,6 +59,32 @@ export function realizedVolatility(prices: number[], period: number): number | n
   return Math.sqrt(Math.max(variance, 0));
 }
 
+/**
+ * ATR (Average True Range) approximé à partir d'une série de prix de clôture.
+ * Faute de high/low intraday, le "true range" est approximé par la variation absolue
+ * entre clôtures consécutives |close[i] - close[i-1]|, moyennée sur `period`.
+ * Retourne l'ATR en valeur absolue (même unité que le prix), ou null si données insuffisantes.
+ */
+export function atr(prices: number[], period = 14): number | null {
+  if (prices.length < period + 1) return null;
+  const window = prices.slice(-(period + 1));
+  const trs: number[] = [];
+  for (let i = 1; i < window.length; i++) {
+    trs.push(Math.abs(window[i] - window[i - 1]));
+  }
+  if (trs.length === 0) return null;
+  return trs.reduce((s, v) => s + v, 0) / trs.length;
+}
+
+/** ATR exprimé en % du dernier prix de la série. */
+export function atrPct(prices: number[], period = 14): number | null {
+  const a = atr(prices, period);
+  if (a === null) return null;
+  const last = prices[prices.length - 1];
+  if (!(last > 0)) return null;
+  return (a / last) * 100;
+}
+
 export type Signal = 'buy' | 'sell' | 'hold';
 
 export interface IndicatorSnapshot {
