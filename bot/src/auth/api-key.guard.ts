@@ -1,6 +1,8 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException, Logger } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { ConfigService } from '@nestjs/config';
+import { Reflector } from '@nestjs/core';
+import { IS_PUBLIC_KEY } from './public.decorator';
 
 /**
  * Guard d'authentification par API key.
@@ -12,9 +14,19 @@ import { ConfigService } from '@nestjs/config';
 export class ApiKeyGuard implements CanActivate {
   private readonly logger = new Logger(ApiKeyGuard.name);
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    private readonly reflector: Reflector,
+  ) {}
 
   canActivate(context: ExecutionContext): boolean {
+    // Routes marquées @Public() : pas d'auth par clé API (ex. webhook Telegram).
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) return true;
+
     const apiKeyHash = this.config.get<string>('API_KEY_HASH');
     if (!apiKeyHash) {
       // Mode dev : pas d'auth

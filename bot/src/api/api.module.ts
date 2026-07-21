@@ -21,6 +21,7 @@ import { StablecoinYieldModule } from '../stablecoin-yield/stablecoin-yield.modu
 import { BacktestModule } from '../backtest/backtest.module';
 import { OptimizeInjectModule } from '../optimize-inject/optimize-inject.module';
 import { PipelineModule } from '../pipeline/pipeline.module';
+import { ReculService } from '../recul/recul.service';
 
 @Module({
   imports: [
@@ -47,5 +48,6 @@ import { PipelineModule } from '../pipeline/pipeline.module';
     OptimizeInjectModule,
   ],
   controllers: [ApiController],
+  providers: [ReculService],
 })
 export class ApiModule {}

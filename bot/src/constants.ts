@@ -90,17 +90,23 @@ export const MAX_TOTAL_EXPOSURE_MR = 800; // $800 total MR
 // sur 3 jambes (WETH 50 %, WBTC 30 %, ARB 20 %) puis réduit par le smart-DCA (×0.5)
 // produisait des jambes minuscules ($0.93-$3) où le gas rongeait le gain.
 // Phase 3 : ticket relevé à $24 / achat toutes les 3 h (~8 achats/jour), jambes ≥ $3
-// (WETH $12 / WBTC $7.2 / ARB $4.8), pour un aller-retour DEX rentable après frais.
+// pour un aller-retour DEX rentable après frais.
 export const DCA_BASE_AMOUNT_USD = 24; // ~$24 par cycle (plage cible $20-30)
 export const DCA_MAX_PER_TRADE_USD = 40; // plafond dur par achat DCA (total panier)
 // Montant minimum par leg (jambe) du panier : $3 pour amortir le gas + frais de pool.
 export const DCA_MIN_LEG_USD = 3;
-// Panier DCA diversifié (recommandation analyste) : WETH 50 %, WBTC 30 %, ARB 20 %.
-// La somme des poids = 1. Chaque cycle répartit le montant total selon ces poids.
+// Panier DCA diversifié — RÉÉQUILIBRAGE (reco analyste, juillet 2026) : réduction de la
+// surpondération ETH (50 % → 25 %) et diversification vers BTC/ARB/LINK/GMX.
+// Répartition : WETH 25 %, WBTC 30 %, ARB 15 %, LINK 15 %, GMX 15 %. Somme des poids = 1.
+// Avec un ticket de base $24 : WETH $6 / WBTC $7.2 / ARB $3.6 / LINK $3.6 / GMX $3.6
+// (toutes les jambes ≥ plancher $3). Chaque cycle répartit le montant total selon ces poids ;
+// les jambes qui tombent sous le plancher (après smart-DCA/coupling) sont redistribuées.
 export const DCA_BASKET: { token: string; weight: number }[] = [
-  { token: 'WETH', weight: 0.5 },
+  { token: 'WETH', weight: 0.25 },
   { token: 'WBTC', weight: 0.3 },
-  { token: 'ARB', weight: 0.2 },
+  { token: 'ARB', weight: 0.15 },
+  { token: 'LINK', weight: 0.15 },
+  { token: 'GMX', weight: 0.15 },
 ];
 
 // ─── Momentum ───
@@ -261,17 +267,16 @@ export const GRID_MAX_MARGIN_PCT = 0.4;
 // large, on augmente le nombre effectif de niveaux pour trader plus souvent (≥ breakeven).
 export const GRID_TARGET_STEP_PCT = 2;
 
-// ─── Arbitrage (réactivé Phase finale — paramètres conservateurs, reco analyste) ───
-// Ancien réglage agressif (50 bps, $500, cron 2 min) non rentable → refonte prudente :
-// spread min relevé à 100 bps (couvre largement gas + slippage), ticket réduit à $200,
-// cron ralenti à 5 min. Le net profit après gas est toujours vérifié avant exécution.
-// Diagnostic 72h : gain/loss ratio arbitrage = 0.008 (catastrophique). Cause : le profit
-// estimé ne soustrayait que ~$0.30 de gas mais IGNORAIT les frais de swap + slippage
-// (~0.8 % du notionnel aller-retour). Résultat : les « gagnants » rapportaient ~$0.005
-// pendant que les perdants coûtaient ~$0.67. Refonte : seuil de spread relevé à 250 bps
-// et gating sur le profit NET réaliste (frais + slippage + gas) + marge, pour viser un
-// gain/loss ratio >= 1.5.
-export const ARB_MIN_SPREAD_BPS = 250;   // min 250 bps (2.5 %) — couvre friction + marge
+// ─── Arbitrage (seuil abaissé — reco analyste, juillet 2026) ───
+// Constat analyste : 4 jours d'inactivité = seuil de spread trop élevé pour la faible
+// volatilité actuelle d'Arbitrum. Recommandation : abaisser le spread minimum à
+// 0.15-0.20 % pour capter davantage d'opportunités. On fixe donc le seuil à 20 bps (0.20 %).
+// ATTENTION (garde-fou conservé) : le gating sur le PROFIT NET réaliste (frais de pool +
+// slippage + gas, ~0.95 % d'aller-retour sur $200) + marge reste actif (ARB_MIN_NET_*).
+// Historiquement, ignorer ce coût avait produit un gain/loss ratio de 0.008 et une
+// hémorragie de capital. Baisser le seuil de spread REND ÉLIGIBLES plus d'opportunités,
+// mais seules celles dont le profit net couvre les frais seront réellement exécutées.
+export const ARB_MIN_SPREAD_BPS = 20;    // min 20 bps (0.20 %) — reco analyste
 export const ARB_MAX_SPREAD_BPS = 500;   // rejet si > 500 bps (anomalie)
 export const ARB_MAX_TRADE_USD = 200;    // ticket réduit à $200
 // Profit NET minimum (après frais de pool + slippage + gas) requis pour exécuter :

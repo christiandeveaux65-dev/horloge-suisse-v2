@@ -20,6 +20,12 @@ export const RT_POOL_FEE_PCT = 0.3; // frais de pool Uniswap par swap (%)
 export const RT_SLIPPAGE_PCT = 0.1; // slippage estimé par swap (%)
 export const RT_GAS_USD = 0.15; // coût de gas estimé par swap (USD)
 export const DEFAULT_MIN_PROFIT_PCT = 1.0; // marge de profit nette minimum visée après frais (%)
+// Marge de profit minimum PAR STRATÉGIE (repli si aucune surcharge app_config).
+// Momentum : abaissée à 0.5 % (reco analyste — rendre la stratégie moins passive en
+// marché calme) → seuil de déclenchement (breakeven) ramené de ~2.0 % à ~1.5 %.
+export const STRATEGY_MIN_PROFIT_PCT_DEFAULTS: Record<string, number> = {
+  momentum: 0.5,
+};
 
 export interface RoundTripEstimate {
   /** Coût total d'un aller-retour, en % du notionnel. */
@@ -87,7 +93,8 @@ export async function getMinProfitPct(prisma: any, strategy: string): Promise<nu
   } catch {
     /* app_config indisponible : repli sur le défaut */
   }
-  return DEFAULT_MIN_PROFIT_PCT;
+  // Repli : défaut spécifique à la stratégie (ex. momentum 0.5 %) sinon défaut global.
+  return STRATEGY_MIN_PROFIT_PCT_DEFAULTS[strategy] ?? DEFAULT_MIN_PROFIT_PCT;
 }
 
 /**

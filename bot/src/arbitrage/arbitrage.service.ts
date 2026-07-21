@@ -19,11 +19,13 @@ import { atrPct } from '../indicators';
  * (>= 50 bps) et reste < 500 bps (au-delà = anomalie rejetée).
  * Montant max par arbitrage : $200 (conservateur). Cron toutes les 5 minutes.
  *
- * ✅ RÉACTIVÉ (Phase finale — juillet 2026) avec des paramètres PRUDENTS suite aux
- * recommandations de l'analyste : spread min relevé à 100 bps (au lieu de 50), ticket
- * réduit à $200 (au lieu de $500), fréquence ralentie à 5 min (au lieu de 2 min).
- * Le profit net après gas est systématiquement vérifié avant toute exécution ; seules
- * les opportunités réellement rentables (token sous-évalué sur le DEX) sont exécutées.
+ * ✅ RÉACTIVÉ avec seuil de spread ABAISSÉ (reco analyste, juillet 2026) : spread min
+ * ramené à 20 bps (0.20 %, au lieu de 250) pour capter plus d'opportunités en faible
+ * volatilité ; ticket $200, fréquence 5 min.
+ * GARDE-FOU CONSERVÉ : le profit NET (après frais de pool + slippage + gas) reste
+ * systématiquement vérifié avant toute exécution (ARB_MIN_NET_PROFIT_USD /
+ * ARB_MIN_NET_MARGIN_PCT). Un spread plus bas rend éligibles davantage d'opportunités,
+ * mais seules celles dont le gain net couvre réellement les frais sont exécutées.
  */
 @Injectable()
 export class ArbitrageService implements OnModuleInit {
@@ -179,9 +181,15 @@ export class ArbitrageService implements OnModuleInit {
     const spreadBps = Math.round(((dexPrice - refPrice) / refPrice) * 10000);
     const absSpread = Math.abs(spreadBps);
 
-    // Seuil de spread effectif : plancher dur ARB_MIN_SPREAD_BPS (250 bps) même si une
-    // ancienne config persistée en DB porte une valeur plus basse (100 bps).
-    const effMinSpread = Math.max(Number(cfg.min_spread_bps) || 0, ARB_MIN_SPREAD_BPS);
+    // Seuil de spread effectif : on prend le PLUS BAS entre la config DB et la constante,
+    // afin qu'un abaissement du seuil (reco analyste → 20 bps) s'applique réellement même
+    // si une ancienne config persistée en DB porte une valeur plus élevée (ex. 250 bps).
+    // Un réglage manuel encore plus bas en DB reste honoré.
+    const cfgSpread = Number(cfg.min_spread_bps);
+    const effMinSpread = Math.min(
+      Number.isFinite(cfgSpread) && cfgSpread > 0 ? cfgSpread : ARB_MIN_SPREAD_BPS,
+      ARB_MIN_SPREAD_BPS,
+    );
     if (absSpread < effMinSpread) {
       return { token, action: 'skip', reason: 'spread_insuffisant', spreadBps, effMinSpread };
     }

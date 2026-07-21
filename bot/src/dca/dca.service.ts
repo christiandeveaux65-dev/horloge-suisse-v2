@@ -13,7 +13,8 @@ import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../
 /**
  * DCA Smart — Achats récurrents diversifiés avec USDC.
  * Optimisé Phase 1 (juillet 2026) : ~$7/cycle toutes les 3 h (~8 cycles/jour).
- * Phase finale : panier DIVERSIFIÉ (reco analyste) — WETH 50 %, WBTC 30 %, ARB 20 %.
+ * Panier DIVERSIFIÉ RÉÉQUILIBRÉ (reco analyste) — WETH 25 %, WBTC 30 %, ARB 15 %,
+ * LINK 15 %, GMX 15 % (réduction de la surpondération ETH).
  * Le montant total du cycle est réparti selon ces poids ; chaque jambe (leg) respecte
  * un plancher intouchable de $0.50 (DCA_MIN_LEG_USD). Fréquence 3 h inchangée.
  * L'ancien réglage ($0.50 toutes les 15 min, ~96/jour) était non rentable car le gas
@@ -200,7 +201,7 @@ export class DcaService {
       this.logger.log('DCA : mode accumulation pur (seuil de repli = 0), filtre de rentabilité ignoré');
     }
 
-    // ─── Répartition sur le panier diversifié (WETH 50 %, WBTC 30 %, ARB 20 %) ───
+    // ─── Répartition sur le panier diversifié (WETH 25 %, WBTC 30 %, ARB 15 %, LINK 15 %, GMX 15 %) ───
     // Les jambes sous le plancher $0.50 sont ignorées, et leur poids est redistribué
     // aux jambes retenues afin de dépenser le montant total prévu.
     const eligible = DCA_BASKET.filter((b) => buyAmount * b.weight >= DCA_MIN_LEG_USD);

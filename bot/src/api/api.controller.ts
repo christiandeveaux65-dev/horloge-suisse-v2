@@ -1,7 +1,9 @@
 import {
-  Controller, Get, Post, Put, Delete, Body, Query, Param, UseGuards,
+  Controller, Get, Post, Put, Delete, Body, Query, Param, Headers, UseGuards,
   HttpException, HttpStatus, Logger,
 } from '@nestjs/common';
+import { Public } from '../auth/public.decorator';
+import { ReculService } from '../recul/recul.service';
 import { ApiTags, ApiOperation, ApiHeader, ApiQuery, ApiParam } from '@nestjs/swagger';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { ApiKeyGuard } from '../auth/api-key.guard';
@@ -57,6 +59,7 @@ export class ApiController {
     private readonly blockchain: BlockchainService,
     private readonly prisma: PrismaService,
     private readonly telegram: TelegramService,
+    private readonly recul: ReculService,
     private readonly schedulerRegistry: SchedulerRegistry,
     private readonly pipeline: PipelineOrchestrator,
   ) {}
@@ -127,6 +130,85 @@ export class ApiController {
   async telegramSummary() {
     await this.telegram.sendSummary();
     return { success: true, message: 'Résumé envoyé' };
+  }
+
+  // ─── WEBHOOK TELEGRAM (commandes entrantes) ───
+
+  @Public()
+  @Post('telegram/webhook')
+  @ApiOperation({ summary: 'Webhook Telegram — reçoit les commandes entrantes (ex. /recul)' })
+  async telegramWebhook(
+    @Body() update: any,
+    @Headers('x-telegram-bot-api-secret-token') secret?: string,
+  ) {
+    // Sécurité : si un secret token est configuré, il doit correspondre.
+    const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
+    if (expected && secret !== expected) {
+      this.logger.warn('[TG-WEBHOOK] Secret token invalide — requête ignorée.');
+      return { ok: true };
+    }
+    try {
+      const msg = update?.message || update?.edited_message || update?.channel_post;
+      const text: string = String(msg?.text || '').trim();
+      const chatId = String(msg?.chat?.id ?? '');
+      if (!text) return { ok: true };
+
+      // N'accepter que le chat configuré (anti-abus).
+      const allowed = process.env.TELEGRAM_CHAT_ID;
+      if (allowed && chatId && chatId !== String(allowed)) {
+        this.logger.warn(`[TG-WEBHOOK] Chat non autorisé: ${chatId}`);
+        return { ok: true };
+      }
+
+      const cmd = text.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
+      if (cmd === '/recul') {
+        this.logger.log('[TG-WEBHOOK] Commande /recul reçue → génération de la prise de recul.');
+        // Fire-and-forget : répondre 200 immédiatement à Telegram, l'analyse peut prendre quelques secondes.
+        void this.runRecul().catch((e) => this.logger.error(`/recul échoué: ${e.message}`));
+      } else if (cmd === '/start' || cmd === '/help') {
+        void this.telegram.sendMessage(
+          "🧭 <b>L'Horloge Suisse v2</b>\nCommande disponible :\n• <b>/recul</b> — prise de recul complète : inventaire des positions, écarts d'allocation, performances par stratégie, déséquilibres et actions correctives suggérées.",
+        );
+      }
+    } catch (e: any) {
+      this.logger.error(`[TG-WEBHOOK] Erreur de traitement: ${e.message}`);
+    }
+    return { ok: true };
+  }
+
+  @Post('recul')
+  @ApiOperation({ summary: 'Génère la « prise de recul » complète et l\'envoie sur Telegram' })
+  async triggerRecul() {
+    return this.runRecul();
+  }
+
+  /** Rassemble l'état du bot, génère la prise de recul et l'envoie sur Telegram. */
+  private async runRecul() {
+    const isDryRun = this.blockchain.getIsDryRun();
+    const riskStatus = await this.risk.getStatus();
+    const modules = {
+      dca: this.dca.isEnabled(),
+      momentum: this.momentum.isEnabled(),
+      mean_reversion: this.meanReversion.isEnabled(),
+      risk: this.risk.isEnabled(),
+      coupling: this.coupling.isEnabled(),
+      market_intelligence: this.marketIntel.isEnabled(),
+      portfolio: this.portfolio.isEnabled(),
+      grid: this.grid.isEnabled(),
+      arbitrage: this.arbitrage.isEnabled(),
+      gmx: this.gmx.isEnabled(),
+      aave: this.aave.isEnabled(),
+      strategist: this.strategist.isEnabled(),
+    };
+    const { message, data } = await this.recul.generate({
+      modules,
+      isDryRun,
+      globalPaused: riskStatus.config?.global_paused ?? false,
+      portfolioValue: riskStatus.portfolioValue ?? 0,
+      drawdownPct: riskStatus.drawdownPct ?? 0,
+    });
+    await this.telegram.sendMessage(message);
+    return { ok: true, message, data };
   }
 
   // ─── ÉTAT GLOBAL ───
