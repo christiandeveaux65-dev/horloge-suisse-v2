@@ -389,10 +389,12 @@ export class MomentumService implements OnModuleInit {
       return null;
     }
 
-    // Trailing stop (au-delà de la détention minimum) — utilise trailing_stop_pct
-    // (param optimisé) s'il est défini, sinon retombe sur stop_loss_pct.
-    const trailingPct = cfg.trailing_stop_pct > 0 ? cfg.trailing_stop_pct : stopLossPct;
-    const trailingStop = highest * (1 - trailingPct / 100);
+    // Trailing stop (au-delà de la détention minimum) — paramètre dédié
+    // trailing_stop_pct, puis fallback sur stop_loss_pct, puis valeur par défaut.
+    const params = cfg as any;
+    const DEFAULT_TRAILING_STOP = 3;
+    const trailingStopPct = params?.trailing_stop_pct ?? params?.stop_loss_pct ?? DEFAULT_TRAILING_STOP;
+    const trailingStop = highest * (1 - Number(trailingStopPct) / 100);
     if (price <= trailingStop) {
       return this.closePosition(cfg, pos, price, 'trailing_stop');
     }

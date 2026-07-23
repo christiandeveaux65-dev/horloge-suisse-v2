@@ -140,7 +140,7 @@ export class OhlcvService {
       where,
       orderBy: { open_time: 'asc' },
     });
-    return rows.map((r) => ({
+    return rows.map((r: any) => ({
       t: r.open_time.getTime(),
       open: parseFloat(r.open),
       high: parseFloat(r.high),
@@ -158,7 +158,7 @@ export class OhlcvService {
       _min: { open_time: true },
       _max: { open_time: true },
     });
-    return grouped.map((g) => ({
+    return grouped.map((g: any) => ({
       token: g.token,
       timeframe: g.timeframe,
       candles: g._count._all,

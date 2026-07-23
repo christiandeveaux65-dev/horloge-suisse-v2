@@ -93,8 +93,8 @@ export class PriceService {
       select: { price_usd: true },
     });
     return records
-      .map((r) => parseFloat(r.price_usd))
-      .filter((p) => p > 0)
+      .map((r: any) => parseFloat(r.price_usd))
+      .filter((p: any) => p > 0)
       .reverse();
   }
 

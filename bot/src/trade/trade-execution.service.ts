@@ -16,6 +16,8 @@ export interface TradeRequest {
   side: 'buy' | 'sell';
   slippageBps?: number;
   strategyId?: string;   // ID de la stratégie (optionnel)
+  skipNotify?: boolean;  // si vrai, on n'envoie PAS la notif Telegram fire-and-forget
+                         // (l'appelant gère lui-même une notification individuelle awaitée)
 }
 
 export interface TradeResult {
@@ -118,7 +120,10 @@ export class TradeExecutionService {
       `Trade ${trade.id} journalisé : ${status} | ${req.amountIn} ${req.sourceToken} → ${swapResult.amountOut} ${req.targetToken}`,
     );
 
-    // Notification Telegram (fire-and-forget, ne bloque jamais le trading)
+    // Notification Telegram (fire-and-forget, ne bloque jamais le trading).
+    // Sautée si l'appelant a demandé skipNotify (ex. DCA, qui envoie sa propre
+    // notification individuelle awaitée par jambe — voir DcaService.executeCycle).
+    if (!req.skipNotify)
     this.telegram.notifyTrade({
       tradeId: trade.id,
       source: req.source,

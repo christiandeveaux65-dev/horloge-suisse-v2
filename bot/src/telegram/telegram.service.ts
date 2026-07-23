@@ -246,6 +246,71 @@ export class TelegramService {
   }
 
   /**
+   * Notification de trade INDIVIDUELLE et IMMÉDIATE (awaitée, sans passer par la
+   * file d'attente 1 msg/minute).
+   *
+   * Raison d'être : le rate-limiter de `notifyTrade` diffère les messages au-delà
+   * du premier via un `setTimeout(...).unref()`. En production, le conteneur se
+   * met en veille dès que la requête HTTP a répondu — le timer différé ne se
+   * déclenche alors JAMAIS et les notifications 2..N sont perdues. C'est le cas
+   * d'un cycle DCA qui exécute plusieurs jambes d'affilée (WETH, WBTC, ARB, LINK,
+   * GMX) : seule la 1re jambe était notifiée.
+   *
+   * Cette méthode envoie chaque notification directement et est `await`-ée dans le
+   * flux d'exécution (avant que la réponse HTTP ne soit renvoyée), ce qui garantit
+   * que chaque achat obtient bien sa propre notification. Réservée aux flux à faible
+   * fréquence (DCA) — les stratégies à forte fréquence continuent d'utiliser
+   * `notifyTrade` (file d'attente + regroupement).
+   */
+  async notifyTradeNow(t: {
+    tradeId?: string;
+    source: string;
+    side: string;
+    sourceToken: string;
+    targetToken: string;
+    amountIn: string;
+    amountOut: string;
+    status: string;
+    txHash?: string;
+    error?: string | null;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    // Dedup par tradeId (partagé avec notifyTrade) : jamais deux notifs pour un
+    // même trade, quel que soit le chemin d'appel.
+    if (t.tradeId) {
+      if (this.notifiedTradeIds.has(t.tradeId)) return;
+      this.notifiedTradeIds.add(t.tradeId);
+      if (this.notifiedTradeIds.size > 2000) {
+        this.notifiedTradeIds = new Set(Array.from(this.notifiedTradeIds).slice(-1000));
+      }
+    }
+
+    let lines: string[] | null = null;
+    if (t.status === 'completed') {
+      lines = [
+        `✅ <b>Trade exécuté</b>`,
+        `📦 ${this.esc(t.source)} (${this.esc(t.side)})`,
+        `🔁 ${this.esc(t.amountIn)} ${this.esc(t.sourceToken)} → ${this.esc(t.amountOut)} ${this.esc(t.targetToken)}`,
+      ];
+      if (t.txHash && !t.txHash.startsWith('dry-run')) {
+        lines.push(`🔗 <a href="https://arbiscan.io/tx/${this.esc(t.txHash)}">Arbiscan</a>`);
+      }
+      lines.push(`🕒 ${this.nowParis()}`);
+    } else if (t.status === 'failed') {
+      lines = [
+        `❌ <b>Trade échoué</b> — ${this.esc(t.source || 'inconnu')}`,
+        `🔁 ${this.esc(t.amountIn)} ${this.esc(t.sourceToken)} → ${this.esc(t.targetToken)}`,
+      ];
+      if (t.error) lines.push(`⚠️ ${this.esc(t.error).slice(0, 200)}`);
+      lines.push(`🕒 ${this.nowParis()}`);
+    }
+    // simulated / partial / autre → AUCUNE notification.
+    if (!lines) return;
+    await this.sendMessage(lines.join('\n'));
+  }
+
+  /**
    * Alerte risque. Notifie UNIQUEMENT les événements CRITIQUES
    * (circuit breaker, pause drawdown > 5 %, stop-loss portefeuille).
    * Tout le reste (recovery_mode, trailing armed, scans…) est ignoré.
@@ -327,9 +392,9 @@ export class TelegramService {
         select: { status: true, source: true, gas_paid: true },
       });
       const total = trades.length;
-      const completed = trades.filter((t) => t.status === 'completed').length;
-      const failed = trades.filter((t) => t.status === 'failed').length;
-      const gas = trades.reduce((s, t) => s + (parseFloat(t.gas_paid) || 0), 0);
+      const completed = trades.filter((t: any) => t.status === 'completed').length;
+      const failed = trades.filter((t: any) => t.status === 'failed').length;
+      const gas = trades.reduce((s: any, t: any) => s + (parseFloat(t.gas_paid) || 0), 0);
 
       const bySource: Record<string, number> = {};
       for (const t of trades) bySource[t.source] = (bySource[t.source] || 0) + 1;

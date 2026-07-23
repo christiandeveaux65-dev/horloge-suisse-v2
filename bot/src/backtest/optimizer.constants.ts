@@ -63,6 +63,8 @@ export const SEARCH_SPACES: Record<StrategyName, Record<string, any[]>> = {
     rsiPeriod: rangeStep(5, 30, 1),
     rsiOversold: rangeStep(15, 40, 1),
     rsiOverbought: rangeStep(55, 85, 1),
+    bbPeriod: rangeStep(10, 40, 2), // période des Bollinger Bands (aligné sur le live bb_period)
+    bbStdDev: rangeStep(1.5, 3.0, 0.1), // écart-type BB (aligné sur le live bb_std_dev)
     tradeSizeUsd: rangeStep(25, 500, 25), // montant par trade
   },
   momentum: {

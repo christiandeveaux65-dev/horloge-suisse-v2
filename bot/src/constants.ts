@@ -101,12 +101,15 @@ export const DCA_MIN_LEG_USD = 3;
 // Avec un ticket de base $24 : WETH $6 / WBTC $7.2 / ARB $3.6 / LINK $3.6 / GMX $3.6
 // (toutes les jambes ≥ plancher $3). Chaque cycle répartit le montant total selon ces poids ;
 // les jambes qui tombent sous le plancher (après smart-DCA/coupling) sont redistribuées.
+// REBALANCING (22/07/2026) : WETH temporairement retiré du panier (poids 0)
+// car surpondéré à 71% (cible 25%). Les 4 autres jambes portent 100% du ticket
+// pour rééquilibrer WBTC/ARB/LINK/GMX. À restaurer à 0.25 dès que WETH < 30%.
 export const DCA_BASKET: { token: string; weight: number }[] = [
-  { token: 'WETH', weight: 0.25 },
-  { token: 'WBTC', weight: 0.3 },
-  { token: 'ARB', weight: 0.15 },
-  { token: 'LINK', weight: 0.15 },
-  { token: 'GMX', weight: 0.15 },
+  { token: 'WETH', weight: 0 },
+  { token: 'WBTC', weight: 0.37 },
+  { token: 'ARB', weight: 0.19 },
+  { token: 'LINK', weight: 0.22 },
+  { token: 'GMX', weight: 0.22 },
 ];
 
 // ─── Momentum ───

@@ -166,6 +166,9 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
   const dcaRefPrice = new Map<string, number>();
   // Sommet atteint par token pour le trailing stop Momentum (trailingStopPct).
   const momPeak = new Map<string, number>();
+  // État TP échelonné par token (miroir de momentum.service.ts partialTakeProfit) :
+  // prix d'entrée, quantité initiale et niveaux déjà déclenchés (tp_hits).
+  const momState = new Map<string, { entryPrice: number; initialAmount: number; tpHits: Set<number> }>();
 
   for (const t of timeline) {
     // Avancer les curseurs jusqu'à t.
@@ -190,7 +193,7 @@ export function simulate(candlesByToken: Map<string, Candle[]>, cfg: SimConfig):
         stepMeanReversion(pf, cfg, cursors, t);
         break;
       case 'momentum':
-        stepMomentum(pf, cfg, cursors, t, momPeak);
+        stepMomentum(pf, cfg, cursors, t, momPeak, momState);
         break;
     }
 
@@ -303,7 +306,9 @@ function stepMeanReversion(
   pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>, t: number,
 ) {
   const rsiPeriod = parseInt(cfg.params.rsiPeriod ?? 14, 10);
-  const oversold = parseFloat(cfg.params.rsiOversold ?? 35);
+  // Défauts alignés sur le live (mean-reversion.service.ts) : rsi_oversold=25,
+  // rsi_overbought=75, bb_period=20, bb_std_dev=2.5.
+  const oversold = parseFloat(cfg.params.rsiOversold ?? 25);
   const overbought = parseFloat(cfg.params.rsiOverbought ?? 75);
   const bbPeriod = parseInt(cfg.params.bbPeriod ?? 20, 10);
   const bbStd = parseFloat(cfg.params.bbStdDev ?? 2.5);
@@ -346,7 +351,18 @@ function stepMeanReversion(
 function stepMomentum(
   pf: Portfolio, cfg: SimConfig, cursors: Map<string, TokenCursor>, t: number,
   momPeak: Map<string, number>,
+  momState: Map<string, { entryPrice: number; initialAmount: number; tpHits: Set<number> }>,
 ) {
+  // Niveaux de take-profit échelonné (miroir de take_profit_levels du live).
+  // Format accepté : "30,60,100" (chaîne), [30,60,100] (tableau) ou vide/absent → désactivé.
+  const rawTp = cfg.params.takeProfitLevels ?? cfg.params.take_profit_levels;
+  const tpLevels: number[] = (() => {
+    if (Array.isArray(rawTp)) return rawTp.map((x) => parseFloat(x)).filter((n) => Number.isFinite(n) && n > 0);
+    if (typeof rawTp === 'string' && rawTp.trim().length) {
+      return rawTp.split(',').map((s) => parseFloat(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+    }
+    return [];
+  })();
   const positionSizeUsd = parseFloat(
     cfg.params.positionSizeUsd ?? cfg.initialCapital / Math.max(1, cfg.tokens.length),
   );
@@ -374,6 +390,7 @@ function stepMomentum(
         if (avgCost > 0 && price <= avgCost * (1 - stopLossPct / 100)) {
           pf.sell(token, 'all', price, t, 'mom_stop_loss');
           momPeak.delete(token);
+          momState.delete(token);
           continue;
         }
       }
@@ -384,7 +401,38 @@ function stepMomentum(
         if (peak > 0 && price <= peak * (1 - trailingStopPct / 100)) {
           pf.sell(token, 'all', price, t, 'mom_trailing_stop');
           momPeak.delete(token);
+          momState.delete(token);
           continue;
+        }
+      }
+      // 3) Take-profit échelonné (miroir de partialTakeProfit du live) : à chaque
+      //    niveau franchi (dans l'ordre, pas de saut), on vend initialAmount / N.
+      //    Au dernier niveau, on solde tout le reste. Un seul niveau par bougie.
+      if (tpLevels.length > 0) {
+        const st = momState.get(token);
+        if (st && st.entryPrice > 0 && st.initialAmount > 0) {
+          for (let lvl = 0; lvl < tpLevels.length; lvl++) {
+            if (st.tpHits.has(lvl)) continue;
+            const tpPrice = st.entryPrice * (1 + tpLevels[lvl] / 100);
+            if (price >= tpPrice) {
+              const isLast = st.tpHits.size + 1 >= tpLevels.length;
+              const posNow = pf['positions'].get(token);
+              const remaining = posNow?.amountToken ?? 0;
+              const fraction = 1 / tpLevels.length;
+              let sellQty = isLast ? remaining : Math.min(st.initialAmount * fraction, remaining);
+              if (sellQty > 0) {
+                pf.sell(token, sellQty, price, t, `mom_take_profit_L${lvl}`);
+                st.tpHits.add(lvl);
+                if (isLast || (pf['positions'].get(token)?.amountToken ?? 0) <= 0) {
+                  momPeak.delete(token);
+                  momState.delete(token);
+                }
+              }
+              break; // pas de saut de niveau
+            } else {
+              break; // niveaux ordonnés croissants : rien à faire au-delà
+            }
+          }
         }
       }
     }
@@ -426,10 +474,17 @@ function stepMomentum(
       const size = Math.min(positionSizeUsd, pf.cash);
       if (size >= 5 && pf.buy(token, size, price, t, 'mom_entry')) {
         momPeak.set(token, price);
+        const posAfter = pf['positions'].get(token);
+        momState.set(token, {
+          entryPrice: price,
+          initialAmount: posAfter?.amountToken ?? 0,
+          tpHits: new Set<number>(),
+        });
       }
     } else if (sellSignal && hasPos) {
       pf.sell(token, 'all', price, t, 'mom_signal_sell');
       momPeak.delete(token);
+      momState.delete(token);
     }
   }
 }

@@ -115,24 +115,29 @@ export class StrategistService {
     const regimeCounts: Record<string, number> = {};
     for (const r of regimes) regimeCounts[r.regime] = (regimeCounts[r.regime] || 0) + 1;
     const dominant = Object.entries(regimeCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'range';
-    let momentumFactor = 1; let mrFactor = 1; let gridFactor = 1; let arbFactor = 1;
-    if (perf.equityChangePct < -5) { momentumFactor *= 0.7; mrFactor *= 0.8; gridFactor *= 0.9; arbFactor *= 0.8; }
-    else if (perf.equityChangePct < 0) { momentumFactor *= 0.85; mrFactor *= 0.9; }
-    else if (perf.equityChangePct > 5) { momentumFactor *= 1.15; arbFactor *= 1.1; }
-    if (winRate < 0.3) { momentumFactor *= 0.8; mrFactor *= 0.85; }
-    else if (winRate > 0.6) { momentumFactor *= 1.1; mrFactor *= 1.1; }
-    if (dominant === 'bear') { momentumFactor *= 0.7; gridFactor *= 1.1; mrFactor *= 1.1; }
-    else if (dominant === 'bull') { momentumFactor *= 1.15; mrFactor *= 0.9; }
-    else if (dominant === 'high_vol') { gridFactor *= 1.15; arbFactor *= 1.1; momentumFactor *= 0.9; }
-    if (riskCfg?.recovery_mode) { momentumFactor *= 0.7; mrFactor *= 0.8; gridFactor *= 0.8; arbFactor *= 0.8; }
+    let momentumFactor = 1; let mrFactor = 1; let gridFactor = 1; let arbFactor = 1; let dcaFactor = 1;
+    if (perf.equityChangePct < -5) { momentumFactor *= 0.7; mrFactor *= 0.8; gridFactor *= 0.9; arbFactor *= 0.8; dcaFactor *= 0.9; }
+    else if (perf.equityChangePct < 0) { momentumFactor *= 0.85; mrFactor *= 0.9; dcaFactor *= 0.95; }
+    else if (perf.equityChangePct > 5) { momentumFactor *= 1.15; arbFactor *= 1.1; dcaFactor *= 1.05; }
+    if (winRate < 0.3) { momentumFactor *= 0.8; mrFactor *= 0.85; dcaFactor *= 0.95; }
+    else if (winRate > 0.6) { momentumFactor *= 1.1; mrFactor *= 1.1; dcaFactor *= 1.05; }
+    if (dominant === 'bear') { momentumFactor *= 0.7; gridFactor *= 1.1; mrFactor *= 1.1; dcaFactor *= 1.1; }
+    else if (dominant === 'bull') { momentumFactor *= 1.15; mrFactor *= 0.9; dcaFactor *= 0.95; }
+    else if (dominant === 'high_vol') { gridFactor *= 1.15; arbFactor *= 1.1; momentumFactor *= 0.9; dcaFactor *= 0.9; }
+    if (riskCfg?.recovery_mode) { momentumFactor *= 0.7; mrFactor *= 0.8; gridFactor *= 0.8; arbFactor *= 0.8; dcaFactor *= 0.9; }
     momentumFactor = this.clampFactor(momentumFactor);
     mrFactor = this.clampFactor(mrFactor);
     gridFactor = this.clampFactor(gridFactor);
     arbFactor = this.clampFactor(arbFactor);
+    dcaFactor = this.clampFactor(dcaFactor);
     return {
       source: 'deterministic',
-      summary: `Equity 7j ${perf.equityChangePct.toFixed(2)}%, winRate ${(winRate*100).toFixed(0)}%, regime ${dominant} => mom=${momentumFactor} mr=${mrFactor} grid=${gridFactor} arb=${arbFactor}`,
-      momentumSizeFactor: momentumFactor, meanReversionSizeFactor: mrFactor, gridSizeFactor: gridFactor, arbitrageSizeFactor: arbFactor,
+      summary: `Equity 7j ${perf.equityChangePct.toFixed(2)}%, winRate ${(winRate*100).toFixed(0)}%, regime ${dominant} => mom=${momentumFactor} mr=${mrFactor} dca=${dcaFactor} grid=${gridFactor} arb=${arbFactor}`,
+      momentumSizeFactor: momentumFactor,
+      meanReversionSizeFactor: mrFactor,
+      dcaSizeFactor: dcaFactor,
+      gridSizeFactor: gridFactor,
+      arbitrageSizeFactor: arbFactor,
     };
   }
 
@@ -143,10 +148,10 @@ export class StrategistService {
 
     const prompt = `Tu es un méta-stratégiste de trading crypto prudent. Voici la performance des 7 derniers jours:\n`
       + `${JSON.stringify(perf)}\nRégimes de marché récents: ${JSON.stringify(regimes.slice(0, 5).map((r) => ({ token: r.token, regime: r.regime })))}\n`
-      + `Propose des FACTEURS d'ajustement de taille de position pour les stratégies momentum et mean_reversion, `
+      + `Propose des FACTEURS d'ajustement de taille de position pour les stratégies momentum, mean_reversion et dca, `
       + `STRICTEMENT entre ${STRATEGIST_PARAM_MIN_FACTOR} et ${STRATEGIST_PARAM_MAX_FACTOR}. `
       + `Ne propose JAMAIS de modifier les limites de risque. Réponds en JSON pur avec ce schéma:\n`
-      + `{"summary": "...", "momentumSizeFactor": 1.0, "meanReversionSizeFactor": 1.0}`;
+      + `{"summary": "...", "momentumSizeFactor": 1.0, "meanReversionSizeFactor": 1.0, "dcaSizeFactor": 1.0}`;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
@@ -171,6 +176,7 @@ export class StrategistService {
         summary: typeof parsed.summary === 'string' ? parsed.summary : 'ajustement LLM',
         momentumSizeFactor: this.clampFactor(parseFloat(parsed.momentumSizeFactor)),
         meanReversionSizeFactor: this.clampFactor(parseFloat(parsed.meanReversionSizeFactor)),
+        dcaSizeFactor: this.clampFactor(parseFloat(parsed.dcaSizeFactor)),
       };
     } finally {
       clearTimeout(timeout);
@@ -185,6 +191,7 @@ export class StrategistService {
   private async applyAdjustments(rec: any): Promise<any> {
     const momentum = this.clampFactor(rec.momentumSizeFactor ?? 1);
     const mr = this.clampFactor(rec.meanReversionSizeFactor ?? 1);
+    const dca = this.clampFactor(rec.dcaSizeFactor ?? 1);
     const upsert = async (key: string, value: string) => {
       await this.prisma.app_config.upsert({
         where: { key },
@@ -196,10 +203,17 @@ export class StrategistService {
     const arb = this.clampFactor(rec.arbitrageSizeFactor ?? 1);
     await upsert('strategist.momentumSizeFactor', String(momentum));
     await upsert('strategist.meanReversionSizeFactor', String(mr));
+    await upsert('strategist.dcaSizeFactor', String(dca));
     await upsert('strategist.gridSizeFactor', String(grid));
     await upsert('strategist.arbitrageSizeFactor', String(arb));
     await upsert('strategist.updatedAt', new Date().toISOString());
-    return { momentumSizeFactor: momentum, meanReversionSizeFactor: mr, gridSizeFactor: grid, arbitrageSizeFactor: arb };
+    return {
+      momentumSizeFactor: momentum,
+      meanReversionSizeFactor: mr,
+      dcaSizeFactor: dca,
+      gridSizeFactor: grid,
+      arbitrageSizeFactor: arb,
+    };
   }
 
   async getStatus(): Promise<any> {

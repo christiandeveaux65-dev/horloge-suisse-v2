@@ -2,7 +2,28 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { PortfolioService } from '../portfolio/portfolio.service';
 import { PriceService } from '../price/price.service';
-import { STABLECOINS, DCA_BASKET } from '../constants';
+import {
+  STABLECOINS,
+  DCA_BASKET,
+  GRID_BUDGET_USD,
+  MOMENTUM_ALTS_BUDGET_USD,
+  MOMENTUM_BC_BUDGET_USD,
+  MAX_TOTAL_EXPOSURE_MR,
+} from '../constants';
+
+// Plafonds de budget CONFIGURÉS par stratégie à budget dédié (valeurs réellement
+// codées/appliquées dans le bot — pas d'invention) :
+//  • grid           → GRID_BUDGET_USD (plafond de sécurité absolu du capital grid)
+//  • momentum       → somme des budgets configurés alts + blue chips
+//  • mean_reversion → MAX_TOTAL_EXPOSURE_MR (plafond dur d'exposition MR)
+// C'est CE plafond qui sert de « cible » réaliste dans /recul, et non plus le
+// `recommended_allocation_pct` du Strategy Evaluator (normalisation de scores qui,
+// lorsque tous les scores non-DCA valent 0, dégénère en ~1,5 % arbitraire).
+const BUDGET_CEILING_USD: Record<string, number> = {
+  grid: GRID_BUDGET_USD,
+  momentum: MOMENTUM_ALTS_BUDGET_USD + MOMENTUM_BC_BUDGET_USD,
+  mean_reversion: MAX_TOTAL_EXPOSURE_MR,
+};
 
 export interface ReculInput {
   modules: Record<string, boolean>;
@@ -21,7 +42,9 @@ interface StratRow {
   reason: string;
   currentUsd: number | null; // budget appliqué (null si non applicable)
   currentPct: number | null; // % du capital
-  gapPct: number | null; // currentPct - targetPct
+  ceilingUsd: number | null; // plafond de budget CONFIGURÉ ($) — stratégies à budget dédié
+  ceilingPct: number | null; // plafond configuré en % du capital
+  gapPct: number | null; // currentPct - ceilingPct (positif = dépassement du plafond)
   moduleEnabled: boolean;
   trades30d: number;
   trades24h: number;
@@ -169,7 +192,13 @@ export class ReculService {
       const currentUsd = budget == null ? null : budget;
       const currentPct =
         currentUsd == null || capital <= 0 ? null : (currentUsd / capital) * 100;
-      const gapPct = currentPct == null || !d ? null : currentPct - targetPct;
+      // Plafond de budget CONFIGURÉ (vraie « cible » réaliste) et son % du capital.
+      const ceilingUsd = BUDGET_CEILING_USD[strat] ?? null;
+      const ceilingPct =
+        ceilingUsd != null && capital > 0 ? (ceilingUsd / capital) * 100 : null;
+      // Écart vs plafond configuré (positif = dépassement du plafond).
+      const gapPct =
+        currentPct == null || ceilingPct == null ? null : currentPct - ceilingPct;
       const st = stats[strat];
       const mk = moduleKey[strat];
       stratRows.push({
@@ -181,6 +210,8 @@ export class ReculService {
         reason: d ? d.reason : '',
         currentUsd,
         currentPct,
+        ceilingUsd,
+        ceilingPct,
         gapPct,
         moduleEnabled: mk ? input.modules[mk] !== false : true,
         trades30d: st ? st.trades30d : 0,
@@ -245,12 +276,12 @@ export class ReculService {
         );
       }
     }
-    // Écarts d'allocation significatifs
+    // Dépassement du plafond de budget CONFIGURÉ (stratégies à budget dédié)
     for (const r of stratRows) {
-      if (r.gapPct != null && Math.abs(r.gapPct) > this.ALLOC_GAP_PCT) {
-        const sens = r.gapPct > 0 ? 'au-dessus' : 'en dessous';
+      if (r.currentUsd != null && r.ceilingUsd != null && r.currentUsd > r.ceilingUsd * 1.05) {
+        const over = r.currentUsd - r.ceilingUsd;
         imbalances.push(
-          `🟠 <b>${r.strategy}</b> ${sens} de sa cible : ${r.currentPct!.toFixed(1)}% vs ${r.targetPct.toFixed(1)}% (écart ${r.gapPct > 0 ? '+' : ''}${r.gapPct.toFixed(1)} pts)`,
+          `🟠 <b>${r.strategy}</b> dépasse son plafond de budget configuré : ${this.fmtUsd(r.currentUsd)} (${r.currentPct!.toFixed(1)}%) > plafond ${this.fmtUsd(r.ceilingUsd)} (${r.ceilingPct!.toFixed(1)}%) — dépassement ${this.fmtUsd(over)}`,
         );
       }
     }
@@ -293,18 +324,15 @@ export class ReculService {
       }
     }
     for (const r of stratRows) {
-      if (r.gapPct != null && r.gapPct > this.ALLOC_GAP_PCT) {
+      if (r.currentUsd != null && r.ceilingUsd != null && r.currentUsd > r.ceilingUsd * 1.05) {
+        const over = r.currentUsd - r.ceilingUsd;
         suggestions.push(
-          `Réduire le budget de <b>${r.strategy}</b> (~$${r.currentUsd!.toFixed(0)}) vers sa cible ${r.targetPct.toFixed(1)}% (~$${((r.targetPct / 100) * capital).toFixed(0)}).`,
-        );
-      } else if (r.gapPct != null && r.gapPct < -this.ALLOC_GAP_PCT && r.active) {
-        suggestions.push(
-          `Renforcer <b>${r.strategy}</b> vers sa cible ${r.targetPct.toFixed(1)}% (budget actuel ~$${r.currentUsd!.toFixed(0)}).`,
+          `Réduire le budget de <b>${r.strategy}</b> (~${this.fmtUsd(r.currentUsd)}) vers son plafond configuré ~${this.fmtUsd(r.ceilingUsd)} (dépassement ${this.fmtUsd(over)}).`,
         );
       }
       if (r.active && r.targetPct >= this.ALLOC_GAP_PCT && !r.moduleEnabled) {
         suggestions.push(
-          `Envisager de réactiver <b>${r.strategy}</b> (recommandé actif, cible ${r.targetPct.toFixed(1)}%) — ou confirmer le maintien de la coupure.`,
+          `Envisager de réactiver <b>${r.strategy}</b> (recommandé actif) — ou confirmer le maintien de la coupure.`,
         );
       }
       if (r.pnlUsd != null && r.pnlUsd < -this.LOSS_ALERT_USD) {
@@ -406,17 +434,21 @@ export class ReculService {
     // sans budget (dca, arbitrage…) n'ont pas de « cible d'allocation » au sens
     // capital : leur activité figure dans la section Performance et — pour le
     // DCA — dans la section Panier DCA ci-dessous.
-    L.push(`<b>🎯 Budgets stratégies : actuel vs cible</b>`);
+    L.push(`<b>🎯 Budgets stratégies : appliqué vs plafond configuré</b>`);
     const allocRows = d.strategies.filter((r: any) => r.currentPct != null);
     if (allocRows.length === 0) L.push('• Aucune stratégie à budget dédié active');
     for (const r of allocRows) {
-      const target = `${r.targetPct.toFixed(1)}%`;
       const cur = `${r.currentPct.toFixed(1)}% (${this.fmtUsd(r.currentUsd)})`;
-      let gap = '';
-      if (r.gapPct != null && Math.abs(r.gapPct) > this.ALLOC_GAP_PCT)
-        gap = r.gapPct > 0 ? ' ⚠️+' : ' ⚠️';
-      const flag = !r.active ? ' 💤' : !r.moduleEnabled ? ' ⚫' : '';
-      L.push(`• <b>${r.strategy}</b> : ${cur} → cible ${target}${gap}${flag}`);
+      const ceil =
+        r.ceilingUsd != null
+          ? `${this.fmtUsd(r.ceilingUsd)} (${r.ceilingPct.toFixed(1)}%)`
+          : '—';
+      const over =
+        r.currentUsd != null && r.ceilingUsd != null && r.currentUsd > r.ceilingUsd * 1.05
+          ? ' ⚠️ dépasse le plafond'
+          : '';
+      const flag = !r.moduleEnabled ? ' ⚫ module coupé' : '';
+      L.push(`• <b>${r.strategy}</b> : ${cur} → plafond ${ceil}${over}${flag}`);
     }
     L.push('');
 

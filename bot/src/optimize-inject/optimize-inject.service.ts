@@ -25,6 +25,8 @@ const PARAM_MAPPING: Record<StrategyName, Record<string, { col: string; type: 'i
     rsiPeriod:     { col: 'rsi_period',     type: 'int' },
     rsiOversold:   { col: 'rsi_oversold',   type: 'int' },
     rsiOverbought: { col: 'rsi_overbought', type: 'int' },
+    bbPeriod:      { col: 'bb_period',      type: 'int' },
+    bbStdDev:      { col: 'bb_std_dev',     type: 'str' },
     tradeSizeUsd:  { col: 'trade_size_usd', type: 'str' },
   },
   momentum: {

@@ -113,7 +113,7 @@ export class BasisTradingService {
       stopLossSpreadPct: this.STOP_LOSS_SPREAD_PCT,
       markets: this.MARKETS,
       note: 'MVP: détection + log. Exécution différée volontairement : une jambe perp GMX serait adoptée et gérée automatiquement par le module GMX (stop-loss/trailing), cassant le hedge spot↔perp. Une exécution sûre nécessite un module de cycle de vie basis isolé (suivi de position dédié) — à câbler en itération dédiée.',
-      recentOpportunities: recent.map(e => ({ detail: e.detail, at: e.created_at, payload: JSON.parse(e.payload) })),
+      recentOpportunities: recent.map((e: any) => ({ detail: e.detail, at: e.created_at, payload: JSON.parse(e.payload) })),
     };
   }
 }

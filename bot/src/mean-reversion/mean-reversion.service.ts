@@ -214,8 +214,10 @@ export class MeanReversionService implements OnModuleInit {
     }
 
     // Calculer la taille du trade — base = trade_size_usd (param optimisé),
-    // bornée par le plafond dur et les expositions restantes.
-    const desiredSize = parseFloat(cfg.trade_size_usd);
+    // avec fallback sur la constante historique si non défini.
+    const params = cfg as any;
+    const tradeSizeUsd = params?.trade_size_usd ?? MAX_TRADE_SIZE_MR;
+    const desiredSize = Number(tradeSizeUsd);
     const baseSize = Number.isFinite(desiredSize) && desiredSize > 0 ? desiredSize : MAX_TRADE_SIZE_MR;
     let sizeUsd = Math.min(
       baseSize,
@@ -346,7 +348,7 @@ export class MeanReversionService implements OnModuleInit {
       where: { status: 'open' },
       select: { cost_usd: true },
     });
-    return positions.reduce((sum, p) => sum + parseFloat(p.cost_usd), 0);
+    return positions.reduce((sum: any, p: any) => sum + parseFloat(p.cost_usd), 0);
   }
 
   private async getTokenExposure(token: string): Promise<number> {
@@ -354,7 +356,7 @@ export class MeanReversionService implements OnModuleInit {
       where: { status: 'open', token },
       select: { cost_usd: true },
     });
-    return positions.reduce((sum, p) => sum + parseFloat(p.cost_usd), 0);
+    return positions.reduce((sum: any, p: any) => sum + parseFloat(p.cost_usd), 0);
   }
 
   async getStatus(): Promise<any> {

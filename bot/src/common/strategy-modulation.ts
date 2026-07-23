@@ -18,8 +18,9 @@ import { PrismaService } from '../prisma/prisma.service';
 
 export type StrategyKey = 'dca' | 'momentum' | 'mean_reversion' | 'grid' | 'arbitrage';
 
-/** Clé app_config du facteur de taille écrit par le Strategist (DCA n'en a pas). */
+/** Clé app_config du facteur de taille écrit par le Strategist. */
 const STRATEGIST_FACTOR_KEY: Partial<Record<StrategyKey, string>> = {
+  dca: 'strategist.dcaSizeFactor',
   momentum: 'strategist.momentumSizeFactor',
   mean_reversion: 'strategist.meanReversionSizeFactor',
   grid: 'strategist.gridSizeFactor',
@@ -66,8 +67,10 @@ export async function getStrategyModulation(
   if (key) {
     try {
       const row = await (prisma as any).app_config.findUnique({ where: { key } });
-      const f = row ? parseFloat(row.value) : NaN;
-      if (Number.isFinite(f) && f > 0) {
+      const raw = row ? parseFloat(row.value) : NaN;
+      if (Number.isFinite(raw) && raw > 0) {
+        // Contrainte Strategist : facteur borné [0.5, 1.5].
+        const f = clamp(raw, 0.5, 1.5);
         sizeFactor *= f;
         parts.push(`strategist ×${f.toFixed(2)}`);
       }

@@ -299,8 +299,8 @@ export class PortfolioService {
       orderBy: { executed_at: 'asc' },
     });
 
-    const totalBoughtUsd = buys.reduce((s, t) => s + parseFloat(t.amount_in), 0);
-    const totalSoldUsd = sells.reduce((s, t) => s + parseFloat(t.amount_out), 0);
+    const totalBoughtUsd = buys.reduce((s: any, t: any) => s + parseFloat(t.amount_in), 0);
+    const totalSoldUsd = sells.reduce((s: any, t: any) => s + parseFloat(t.amount_out), 0);
 
     // Valeur actuelle du solde restant en portefeuille
     let currentValue = 0;

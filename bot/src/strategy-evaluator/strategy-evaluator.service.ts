@@ -118,7 +118,7 @@ export class StrategyEvaluatorService {
 
     const scores: StrategyScore[] = [];
     for (const strat of EVALUATED_STRATEGIES) {
-      const stratTrades = trades.filter((t) => t.source === strat);
+      const stratTrades = trades.filter((t: any) => t.source === strat);
       scores.push(this.scoreStrategy(strat, stratTrades, regime, ethPrice));
     }
 
@@ -234,7 +234,7 @@ export class StrategyEvaluatorService {
     const winRate = lotReturns.length > 0 ? wins.length / lotReturns.length : null;
     const avgWin = wins.length > 0 ? wins.reduce((a, b) => a + b, 0) / wins.length : 0;
     const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((a, b) => a + b, 0) / losses.length) : 0;
-    const gainLossRatio = avgLoss > 0 ? avgWin / avgLoss : wins.length > 0 ? null : null;
+    const gainLossRatio = avgLoss > 0 ? avgWin / avgLoss : avgWin > 0 ? 999 : 1;
     const sharpe = this.simplifiedSharpe(lotReturns);
 
     const perfScore = this.performanceScore({

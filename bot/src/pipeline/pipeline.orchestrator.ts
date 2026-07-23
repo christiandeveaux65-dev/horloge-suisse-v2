@@ -49,6 +49,7 @@ export const MODULE_INTERVALS_MS: Record<string, number> = {
   auto_reoptimize: 3600000, // 1 h
   supervision: 300000, // 5 min
   strategy_evaluator: 900000, // 15 min
+  apply_directives: 180000, // 3 min (chaque cycle pipeline)
   maintenance: 86400000, // 24 h — purge des tables historiques (anti-croissance illimitée)
 };
 
@@ -220,7 +221,7 @@ export class PipelineOrchestrator {
         for (const strat of ['grid', 'mean_reversion', 'momentum', 'dca'] as const) {
           const t0 = Date.now();
           try {
-            await this.optimizeInject.autoReoptimize(strat, 1.0, 5000, 200);
+            await this.optimizeInject.autoReoptimize(strat, 0.5, 5000, 200);
             executed.push(`auto_reoptimize:${strat}`);
             this.logger.log(`[PIPELINE] Phase 7 OPTIMISER: auto_reoptimize(${strat}) ✅ (${Date.now() - t0}ms)`);
           } catch (e: any) {

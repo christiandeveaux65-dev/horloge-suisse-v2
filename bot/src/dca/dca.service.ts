@@ -9,6 +9,7 @@ import {
 } from '../constants';
 import { getStrategyModulation } from '../common/strategy-modulation';
 import { estimateRoundTripCost, getMinProfitPct, passesProfitability } from '../common/profitability';
+import { TelegramService } from '../telegram/telegram.service';
 
 /**
  * DCA Smart — Achats récurrents diversifiés avec USDC.
@@ -29,6 +30,7 @@ export class DcaService {
     private readonly prisma: PrismaService,
     private readonly tradeExecution: TradeExecutionService,
     private readonly priceService: PriceService,
+    private readonly telegram: TelegramService,
   ) {}
 
   isEnabled(): boolean { return this.enabled; }
@@ -46,8 +48,14 @@ export class DcaService {
     }
   }
 
-  /** Exécuter un cycle DCA */
-  async executeCycle(): Promise<any> {
+  /** Exécuter un cycle DCA.
+   * @param opts.force  Si vrai, bypasse les gardes de timing (interval_hours) et de
+   *   repli (buy_threshold_pct) ainsi que les réductions adaptatives (smart DCA,
+   *   coupling, modulation, recovery) pour exécuter immédiatement un cycle au
+   *   montant de base plein. La pause globale reste toujours respectée. */
+  async executeCycle(opts?: { force?: boolean }): Promise<any> {
+    const force = opts?.force === true;
+    if (force) this.logger.warn('DCA : cycle FORCÉ (gardes de timing/repli et réductions bypassées)');
     // Vérifier pause globale
     const riskCfg = await this.prisma.risk_config.findFirst();
     if (riskCfg?.global_paused) {
@@ -90,7 +98,7 @@ export class DcaService {
 
     // ─── Pilotage adaptatif (Strategy Evaluator) ───
     const modulation = await getStrategyModulation(this.prisma, 'dca');
-    if (!modulation.active) {
+    if (!modulation.active && !force) {
       this.logger.warn(`DCA skipé : directive inactive (${modulation.reason})`);
       return { success: false, reason: 'directive_inactive', modulation: modulation.reason };
     }
@@ -99,7 +107,7 @@ export class DcaService {
     // Le pipeline appelle DCA toutes les 3 h ; si l'optimisation demande un intervalle
     // plus long, on saute tant que le dernier achat est trop récent.
     const intervalHours = strategy.interval_hours || 0;
-    if (intervalHours > 3) {
+    if (!force && intervalHours > 3) {
       const lastBuy = await this.prisma.trade.findFirst({
         where: { source: 'dca', status: { in: ['completed', 'simulated'] } },
         orderBy: { executed_at: 'desc' },
@@ -115,10 +123,15 @@ export class DcaService {
     }
 
     // ─── Paramètre optimisé : buy_threshold_pct (n'acheter que sur repli) ───
-    // Si > 0, l'achat n'a lieu que si le prix WETH a reculé d'au moins ce %
-    // depuis son plus haut récent (achat de repli). 0 = achat systématique.
-    const buyThresholdPct = strategy.buy_threshold_pct || 0;
-    if (buyThresholdPct > 0) {
+    // Compatibilité : accepte aussi l'alias `dca_buy_threshold` si présent.
+    // Le backtest peut produire un seuil négatif (ex: -5) pour signifier "-5%".
+    // En live, on travaille sur un drawdown positif : on normalise donc en valeur absolue.
+    const strategyParams = strategy as any;
+    const buyThresholdRaw = Number(
+      strategyParams.buy_threshold_pct ?? strategyParams.dca_buy_threshold ?? 0,
+    );
+    const buyThresholdPct = Number.isFinite(buyThresholdRaw) ? Math.abs(buyThresholdRaw) : 0;
+    if (!force && buyThresholdPct > 0) {
       const series = await this.priceService.getPriceSeries('WETH', 100);
       if (series.length >= 5) {
         const recentMax = Math.max(...series);
@@ -132,34 +145,47 @@ export class DcaService {
     }
 
     // ─── Paramètre optimisé : amount_per_buy (montant de base du cycle) ───
-    // On lit la config (injectée par l'optimiseur) au lieu d'une constante figée.
+    // Compatibilité : accepte aussi l'alias `dca_amount_pct` si présent dans la config
+    // (pourcentage du montant de base historique DCA_BASE_AMOUNT_USD).
     // Le plafond dur DCA_MAX_PER_TRADE_USD reste appliqué plus bas.
-    const configuredBase = parseFloat(strategy.amount_per_buy);
+    const amountPerBuyRaw = Number(strategyParams.amount_per_buy);
+    const dcaAmountPctRaw = Number(strategyParams.dca_amount_pct);
+    const amountFromPct = Number.isFinite(dcaAmountPctRaw) && dcaAmountPctRaw > 0
+      ? (DCA_BASE_AMOUNT_USD * dcaAmountPctRaw) / 100
+      : NaN;
+    const configuredBase = Number.isFinite(amountPerBuyRaw) && amountPerBuyRaw > 0
+      ? amountPerBuyRaw
+      : amountFromPct;
     let buyAmount =
       Number.isFinite(configuredBase) && configuredBase > 0
         ? Math.min(configuredBase, DCA_MAX_PER_TRADE_USD)
         : DCA_BASE_AMOUNT_USD;
 
-    // 1. Smart DCA : ajustement basé sur les trades récents
-    if (strategy.smart_dca) {
-      buyAmount = await this.applySmartDca(strategy.id, buyAmount);
-    }
+    // Les ajustements ci-dessous (smart DCA, coupling, modulation, recovery) sont
+    // bypassés en mode FORCÉ pour tester un cycle plein au montant de base.
+    let couplingMult = 1;
+    if (!force) {
+      // 1. Smart DCA : ajustement basé sur les trades récents
+      if (strategy.smart_dca) {
+        buyAmount = await this.applySmartDca(strategy.id, buyAmount);
+      }
 
-    // 2. Coupling : multiplicateur régime de marché
-    const couplingMult = await this.getCouplingMultiplier();
-    if (couplingMult !== 1) {
-      buyAmount = buyAmount * couplingMult;
-    }
+      // 2. Coupling : multiplicateur régime de marché
+      couplingMult = await this.getCouplingMultiplier();
+      if (couplingMult !== 1) {
+        buyAmount = buyAmount * couplingMult;
+      }
 
-    // 2bis. Pilotage adaptatif : facteur de taille Strategist × allocation Evaluator
-    if (modulation.sizeFactor !== 1) {
-      buyAmount = buyAmount * modulation.sizeFactor;
-    }
+      // 2bis. Pilotage adaptatif : facteur de taille Strategist × allocation Evaluator
+      if (modulation.sizeFactor !== 1) {
+        buyAmount = buyAmount * modulation.sizeFactor;
+      }
 
-    // 3. Recovery : facteur de réduction si drawdown modéré
-    if (riskCfg?.recovery_mode) {
-      const recoveryFactor = parseFloat(riskCfg.recovery_factor) || 0.5;
-      buyAmount = buyAmount * recoveryFactor;
+      // 3. Recovery : facteur de réduction si drawdown modéré
+      if (riskCfg?.recovery_mode) {
+        const recoveryFactor = parseFloat(riskCfg.recovery_factor) || 0.5;
+        buyAmount = buyAmount * recoveryFactor;
+      }
     }
 
     // 4. Plafonnement max_per_trade (borne dure $10 via constante)
@@ -232,6 +258,10 @@ export class DcaService {
         side: 'buy',
         slippageBps: strategy.slippage_bps,
         strategyId: strategy.id,
+        // On désactive la notif fire-and-forget (file 1 msg/min qui perd les jambes
+        // 2..N en prod) et on envoie à la place une notif individuelle awaitée
+        // ci-dessous, garantissant qu'un message part pour CHAQUE achat du panier.
+        skipNotify: true,
       });
 
       if (result.success) { anySuccess = true; spent += legAmount; }
@@ -239,6 +269,20 @@ export class DcaService {
         `DCA ${result.success ? '✅' : '❌'} : $${legAmount} USDC → ${result.amountOut} ${leg.token} ` +
         `(poids ${(leg.weight * 100).toFixed(0)}%, coupling ×${couplingMult.toFixed(2)})`,
       );
+      // Notification Telegram INDIVIDUELLE et awaitée pour cette jambe (WETH, WBTC,
+      // ARB, LINK, GMX) — chaque achat a son propre message, y compris en prod.
+      await this.telegram.notifyTradeNow({
+        tradeId: result.tradeId,
+        source: 'dca',
+        side: 'buy',
+        sourceToken: 'USDC',
+        targetToken: leg.token,
+        amountIn: result.amountIn,
+        amountOut: result.amountOut,
+        status: result.status,
+        txHash: result.txHash,
+        error: result.error,
+      });
       legResults.push({ token: leg.token, weightPct: leg.weight * 100, legAmount, result });
     }
 
@@ -270,11 +314,11 @@ export class DcaService {
     if (recentTrades.length < 3) return baseAmount;
 
     // Calculer le ratio prix moyen récent vs premier prix
-    const prices = recentTrades.map((t) => parseFloat(t.price)).filter((p) => p > 0);
+    const prices = recentTrades.map((t: any) => parseFloat(t.price)).filter((p: any) => p > 0);
     if (prices.length < 2) return baseAmount;
 
-    const avgRecent = prices.slice(0, 3).reduce((s, v) => s + v, 0) / 3;
-    const avgOlder = prices.slice(-3).reduce((s, v) => s + v, 0) / Math.min(3, prices.slice(-3).length);
+    const avgRecent = prices.slice(0, 3).reduce((s: any, v: any) => s + v, 0) / 3;
+    const avgOlder = prices.slice(-3).reduce((s: any, v: any) => s + v, 0) / Math.min(3, prices.slice(-3).length);
 
     if (avgOlder === 0) return baseAmount;
 

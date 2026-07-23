@@ -208,7 +208,7 @@ export class FlashLoanService {
       reserveUsdc: this.RESERVE_USDC,
       triangles: this.TRIANGLES.map(t => t.join('→')),
       note: 'Exécution ACTIVE : quotes DEX réelles (Uniswap Quoter V2) + 3 swaps réels séquentiels (capital wallet borné, PAS de flash loan) si net-profitable. Respecte le Risk Manager.',
-      recentOpportunities: recent.map(e => ({ detail: e.detail, at: e.created_at, payload: JSON.parse(e.payload) })),
+      recentOpportunities: recent.map((e: any) => ({ detail: e.detail, at: e.created_at, payload: JSON.parse(e.payload) })),
     };
   }
 }

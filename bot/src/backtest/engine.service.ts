@@ -126,7 +126,7 @@ export class BacktestEngineService {
       orderBy: { created_at: 'desc' },
       take: Math.min(200, Math.max(1, limit)),
     });
-    return { count: rows.length, runs: rows.map((r) => this.format(r, false)) };
+    return { count: rows.length, runs: rows.map((r: any) => this.format(r, false)) };
   }
 
   // ── helpers ──

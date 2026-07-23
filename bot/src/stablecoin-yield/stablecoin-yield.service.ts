@@ -252,7 +252,7 @@ export class StablecoinYieldService implements OnModuleInit {
       maxSupplyPerRotationUsd: this.MAX_SUPPLY_PER_ROTATION,
       maxAllocationPct: this.MAX_ALLOCATION_PCT,
       note: `Exécution ACTIVE : rotation réelle vers Aave V3 supply (USDC) au-dessus de la réserve, PLAFONNÉE à ${this.MAX_ALLOCATION_PCT}% du portfolio total (cumul tous cycles). Chaque opération Aave (supply/borrow/withdraw/repay) déclenche une notification Telegram. Autres venues (GMX GM) = comparaison seulement.`,
-      recentDecisions: recent.map(e => ({ kind: e.kind, detail: e.detail, at: e.created_at, payload: JSON.parse(e.payload) })),
+      recentDecisions: recent.map((e: any) => ({ kind: e.kind, detail: e.detail, at: e.created_at, payload: JSON.parse(e.payload) })),
     };
   }
 }

@@ -314,6 +314,149 @@ export class ApiController {
     }
   }
 
+  // ─── CLEANUP : swap surplus/résidus → USDC ───
+  @Post('cleanup/swap-surplus')
+  @ApiOperation({
+    summary: 'Vend en une fois vers USDC : surplus Mean Reversion (positions au-dessus de la limite), excédent WETH (au-dessus du budget cible), UNI et PENDLE résiduels. dryRun=true par défaut (aperçu sans exécution).',
+  })
+  async swapSurplus(
+    @Body()
+    body: {
+      wethTargetUsd?: number;
+      mrLimitUsd?: number;
+      sellUni?: boolean;
+      sellPendle?: boolean;
+      dustThresholdUsd?: number;
+      slippageBps?: number;
+      dryRun?: boolean;
+    },
+  ) {
+    const dryRun = body?.dryRun !== false; // sécurité : dry-run tant que dryRun:false n'est pas envoyé explicitement
+    const slippageBps = body?.slippageBps ?? 150;
+    const mrLimitUsd = body?.mrLimitUsd ?? 800;
+    const dust = body?.dustThresholdUsd ?? 0.5;
+    const sellUni = body?.sellUni !== false;
+    const sellPendle = body?.sellPendle !== false;
+
+    const pf = await this.portfolio.getPortfolio();
+    const tokens: any[] = pf?.tokens || [];
+    const findTok = (s: string) => tokens.find((t) => t.symbol === s);
+    const plan: any[] = [];
+
+    // 1. Surplus Mean Reversion : positions ouvertes au-dessus de la limite
+    const mrPos = await this.prisma.mean_reversion_position.findMany({
+      where: { status: 'open' },
+    });
+    const mrExposure = mrPos.reduce((s: any, p: any) => s + parseFloat(p.cost_usd), 0);
+    const mrSurplus = Math.max(0, mrExposure - mrLimitUsd);
+    if (mrSurplus > dust) {
+      const byTok: Record<string, number> = {};
+      for (const p of mrPos) byTok[p.token] = (byTok[p.token] || 0) + parseFloat(p.cost_usd);
+      for (const [tok, exp] of Object.entries(byTok)) {
+        const share = mrExposure > 0 ? exp / mrExposure : 0;
+        const usdToSell = mrSurplus * share;
+        const t = findTok(tok);
+        if (t && t.priceUsd > 0 && usdToSell > dust) {
+          plan.push({
+            category: 'mr_surplus',
+            token: tok,
+            usd: +usdToSell.toFixed(2),
+            amount: (usdToSell / t.priceUsd).toFixed(8),
+          });
+        }
+      }
+    }
+
+    // 2. Excédent WETH au-dessus du budget cible (nécessite wethTargetUsd)
+    if (typeof body?.wethTargetUsd === 'number') {
+      const w = findTok('WETH');
+      if (w && w.priceUsd > 0 && w.valueUsd > body.wethTargetUsd + dust) {
+        const usd = w.valueUsd - body.wethTargetUsd;
+        plan.push({
+          category: 'weth_excess',
+          token: 'WETH',
+          usd: +usd.toFixed(2),
+          amount: (usd / w.priceUsd).toFixed(8),
+        });
+      }
+    }
+
+    // 3. UNI résiduel
+    if (sellUni) {
+      const u = findTok('UNI');
+      if (u && u.valueUsd > dust) {
+        plan.push({ category: 'uni_residual', token: 'UNI', usd: +u.valueUsd.toFixed(2), amount: 'all' });
+      } else {
+        plan.push({
+          category: 'uni_residual',
+          token: 'UNI',
+          usd: u ? +u.valueUsd.toFixed(4) : 0,
+          amount: 'skip',
+          reason: `poussière < seuil $${dust}`,
+        });
+      }
+    }
+
+    // 4. PENDLE résiduel
+    if (sellPendle) {
+      const pn = findTok('PENDLE');
+      if (pn && pn.valueUsd > dust) {
+        plan.push({ category: 'pendle_residual', token: 'PENDLE', usd: +pn.valueUsd.toFixed(2), amount: 'all' });
+      } else {
+        plan.push({
+          category: 'pendle_residual',
+          token: 'PENDLE',
+          usd: pn ? +pn.valueUsd.toFixed(6) : 0,
+          amount: 'skip',
+          reason: `poussière < seuil $${dust}`,
+        });
+      }
+    }
+
+    const summary = {
+      mrExposure: +mrExposure.toFixed(2),
+      mrLimitUsd,
+      mrSurplus: +mrSurplus.toFixed(2),
+      wethTargetUsd: body?.wethTargetUsd ?? null,
+      slippageBps,
+    };
+
+    if (dryRun) {
+      this.logger.log(`[CLEANUP] Aperçu swap-surplus (dry-run) : ${JSON.stringify(plan)}`);
+      return {
+        dryRun: true,
+        ...summary,
+        plan,
+        note: 'Aucune vente exécutée. Renvoyez le même appel avec "dryRun": false pour exécuter réellement les swaps on-chain.',
+      };
+    }
+
+    this.logger.warn(`[CLEANUP] EXÉCUTION swap-surplus : ${JSON.stringify(plan)}`);
+    const results: any[] = [];
+    for (const item of plan) {
+      if (item.amount === 'skip') {
+        results.push({ ...item, executed: false });
+        continue;
+      }
+      try {
+        const r: any = await this.tradeExecution.manualSell(
+          item.token,
+          item.amount === 'all' ? 'all' : item.amount,
+          slippageBps,
+        );
+        results.push({
+          ...item,
+          executed: true,
+          txHash: r?.txHash ?? r?.hash ?? null,
+          status: r?.status ?? null,
+        });
+      } catch (e: any) {
+        results.push({ ...item, executed: false, error: e.message });
+      }
+    }
+    return { dryRun: false, ...summary, results };
+  }
+
   // ─── WALLET LEDGER (mouvements de fonds externes — leçon #7) ───
 
   @Get('wallet-ledger')
@@ -582,6 +725,16 @@ export class ApiController {
     return { module, enabled: newState };
   }
 
+  @Post('dca/force')
+  @ApiOperation({
+    summary: 'Force un cycle DCA immédiat',
+    description:
+      'Déclenche immédiatement un cycle DCA en bypassant les gardes de timing (interval_hours), le seuil de repli (buy_threshold_pct) et les réductions adaptatives (smart DCA, coupling, modulation, recovery), afin d\'acheter le panier complet (WETH/WBTC/ARB/LINK/GMX) au montant de base plein. La pause globale reste respectée.',
+  })
+  async forceDca() {
+    return this.dca.executeCycle({ force: true });
+  }
+
   // ─── EXÉCUTION ET STATUT PAR MODULE (routes paramétrées en dernier) ───
 
   @Post('module/:module/execute')
@@ -727,8 +880,8 @@ export class ApiController {
         let bbMiddle: number | null = null, bbUpper: number | null = null, bbLower: number | null = null;
         if (prices.length >= bbPeriod) {
           const slice = prices.slice(-bbPeriod);
-          bbMiddle = slice.reduce((a, b) => a + b, 0) / bbPeriod;
-          const variance = slice.reduce((a, b) => a + (b - (bbMiddle as number)) ** 2, 0) / bbPeriod;
+          bbMiddle = slice.reduce((a: any, b: any) => a + b, 0) / bbPeriod;
+          const variance = slice.reduce((a: any, b: any) => a + (b - (bbMiddle as number)) ** 2, 0) / bbPeriod;
           const std = Math.sqrt(variance);
           bbUpper = bbMiddle + 2 * std;
           bbLower = bbMiddle - 2 * std;

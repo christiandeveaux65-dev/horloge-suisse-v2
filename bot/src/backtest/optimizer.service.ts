@@ -339,7 +339,7 @@ export class OptimizerService {
       orderBy: { created_at: 'desc' },
       take: Math.min(200, Math.max(1, limit)),
     });
-    return { count: rows.length, optimizations: rows.map((r) => this.format(r)) };
+    return { count: rows.length, optimizations: rows.map((r: any) => this.format(r)) };
   }
 
   // ──────────────── helpers ────────────────
